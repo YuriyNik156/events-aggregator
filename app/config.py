@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass, field
 
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
@@ -66,3 +67,21 @@ def _from_connection_string(value: str) -> URL:
     if url.drivername in ("postgres", "postgresql"):
         url = url.set(drivername=DRIVER)
     return url
+
+
+DEFAULT_EVENTS_PROVIDER_URL = "http://events-provider.dev-2.python-labs.ru"
+
+
+@dataclass(frozen=True)
+class ProviderSettings:
+    base_url: str
+    api_key: str = field(repr=False)
+
+
+def get_provider_settings() -> ProviderSettings:
+    """Events Provider address and key from the environment (key is a secret)."""
+    api_key = _env("EVENTS_PROVIDER_API_KEY")
+    if not api_key:
+        raise ConfigError("EVENTS_PROVIDER_API_KEY is not set")
+    base_url = _env("EVENTS_PROVIDER_BASE_URL") or DEFAULT_EVENTS_PROVIDER_URL
+    return ProviderSettings(base_url=base_url, api_key=api_key)

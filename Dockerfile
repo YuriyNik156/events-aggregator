@@ -21,4 +21,6 @@ COPY --chown=appuser:appuser alembic ./alembic
 
 USER appuser
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Migrate first: a failed migration exits non-zero, so the app never serves
+# requests without its tables. exec keeps uvicorn as PID 1 for clean shutdown.
+CMD ["sh", "-c", "alembic upgrade head && exec uvicorn main:app --host 0.0.0.0 --port 8000"]

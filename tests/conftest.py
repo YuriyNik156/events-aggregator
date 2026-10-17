@@ -1,6 +1,6 @@
 import os
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -87,3 +87,33 @@ def make_ticket(ticket_id: str = "t1", event_id: str = "e1", **overrides) -> dic
     }
     data.update(overrides)
     return data
+
+
+INITIAL = date(2000, 1, 1)
+
+
+def provider_event_json(event_id: str = "e1", **overrides) -> dict:
+    """An event in the Events Provider response format."""
+    data = {
+        "id": event_id,
+        "name": "Concert",
+        "place": {
+            "id": "p1",
+            "name": "Hall",
+            "city": "Moscow",
+            "address": "Main st. 1",
+            "seats_pattern": "A1-10",
+        },
+        "event_time": "2026-01-11T17:00:00+03:00",
+        "registration_deadline": "2026-01-10T17:00:00+03:00",
+        "status": "published",
+        "number_of_visitors": 5,
+        "changed_at": "2026-01-05T07:00:00+00:00",
+        "created_at": "2025-12-01T10:00:00+03:00",
+    }
+    data.update(overrides)
+    return data
+
+
+def provider_page(results: list[dict], next_url: str | None = None) -> dict:
+    return {"next": next_url, "previous": None, "results": results}

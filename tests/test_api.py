@@ -1,0 +1,184 @@
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from unittest.mock import Mock
+from urllib.parse import parse_qs, urlparse
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
+
+import main
+from app.events_provider import EventsPage, ProviderUnavailableError
+from app.models import Base
+from app.repositories import EventRepository
+from tests.conftest import make_event, provider_event_json, provider_page
+
+
+@pytest.fixture
+def db() -> Iterator[Session]:
+    # One shared connection: TestClient runs sync endpoints in another thread.
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    with Session(engine) as s:
+        yield s
+    engine.dispose()
+
+
+@pytest.fixture
+def provider() -> Mock:
+    return Mock()
+
+
+@pytest.fixture
+def client(db, provider) -> Iterator[TestClient]:
+    main.app.dependency_overrides[main.get_session] = lambda: db
+    main.app.dependency_overrides[main.get_provider_client] = lambda: provider
+    yield TestClient(main.app)
+    main.app.dependency_overrides.clear()
+
+
+def seed(db, *events: dict) -> None:
+    repo = EventRepository(db)
+    for e in events:
+        repo.upsert(e)
+    db.commit()
+
+
+def test_empty_database_returns_all_fields(client):
+    response = client.get("/api/events")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "count": 0,
+        "next": None,
+        "previous": None,
+        "results": [],
+    }
+
+
+def test_event_structure(client, db):
+    seed(db, make_event("e1"))
+
+    body = client.get("/api/events").json()
+
+    assert body["count"] == 1
+    event = body["results"][0]
+    assert set(event) == {
+        "id",
+        "name",
+        "place",
+        "event_time",
+        "registration_deadline",
+        "status",
+        "number_of_visitors",
+    }
+    assert event["place"] == {
+        "id": "p1",
+        "name": "Hall",
+        "city": "Moscow",
+        "address": "Main st. 1",
+    }
+    assert event["status"] == "published"
+
+
+def test_pagination_links_and_count(client, db):
+    seed(db, *[make_event(f"e{i}") for i in range(5)])
+
+    first = client.get("/api/events", params={"page_size": 2}).json()
+    middle = client.get("/api/events", params={"page": 2, "page_size": 2}).json()
+    last = client.get("/api/events", params={"page": 3, "page_size": 2}).json()
+
+    assert first["count"] == middle["count"] == last["count"] == 5
+    assert [len(p["results"]) for p in (first, middle, last)] == [2, 2, 1]
+    assert first["previous"] is None
+    assert last["next"] is None
+    assert urlparse(first["next"]).path == "/api/events"
+    assert parse_qs(urlparse(first["next"]).query) == {
+        "page_size": ["2"],
+        "page": ["2"],
+    }
+    assert parse_qs(urlparse(middle["previous"]).query)["page"] == ["1"]
+    assert parse_qs(urlparse(middle["next"]).query)["page"] == ["3"]
+
+
+def test_date_from_filters_and_is_kept_in_links(client, db):
+    seed(
+        db,
+        make_event("old", event_time=datetime(2026, 1, 1, 23, 59, tzinfo=UTC)),
+        make_event("edge", event_time=datetime(2026, 1, 2, 0, 0, tzinfo=UTC)),
+        make_event("new", event_time=datetime(2026, 1, 3, tzinfo=UTC)),
+    )
+
+    body = client.get(
+        "/api/events", params={"date_from": "2026-01-02", "page_size": 1}
+    ).json()
+
+    assert body["count"] == 2
+    assert [e["id"] for e in body["results"]] == ["edge"]
+    assert parse_qs(urlparse(body["next"]).query)["date_from"] == ["2026-01-02"]
+
+
+def test_page_past_the_end_is_empty_not_404(client, db):
+    seed(db, make_event("e1"))
+
+    response = client.get("/api/events", params={"page": 5})
+
+    assert response.status_code == 200
+    assert response.json()["results"] == []
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"page": 0},
+        {"page": "x"},
+        {"page_size": 0},
+        {"page_size": -1},
+        {"date_from": "yesterday"},
+    ],
+)
+def test_invalid_query_returns_422(client, params):
+    assert client.get("/api/events", params=params).status_code == 422
+
+
+def test_sync_trigger_fills_event_list(client, provider):
+    provider.get_events_page.return_value = EventsPage.model_validate(
+        provider_page([provider_event_json("e1")])
+    )
+
+    response = client.post("/api/sync/trigger")
+
+    assert response.status_code == 200
+    assert response.json() == {"success": True}
+    assert client.get("/api/events").json()["count"] == 1
+
+
+def test_sync_trigger_provider_failure_returns_502(client, provider):
+    provider.get_events_page.side_effect = ProviderUnavailableError("down")
+
+    response = client.post("/api/sync/trigger")
+
+    assert response.status_code == 502
+    assert client.get("/api/events").json()["count"] == 0
+
+
+def test_sync_trigger_without_api_key_returns_500(db, monkeypatch):
+    monkeypatch.delenv("EVENTS_PROVIDER_API_KEY", raising=False)
+    main.app.dependency_overrides[main.get_session] = lambda: db
+    try:
+        response = TestClient(main.app).post("/api/sync/trigger")
+    finally:
+        main.app.dependency_overrides.clear()
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Events Provider is not configured"}
+
+
+def test_health_still_works(client):
+    assert client.get("/api/health").json() == {"status": "ok"}
