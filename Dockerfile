@@ -15,7 +15,9 @@ ENV UV_COMPILE_BYTECODE=1 \
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev
 
-COPY --chown=appuser:appuser main.py .
+COPY --chown=appuser:appuser main.py alembic.ini ./
+COPY --chown=appuser:appuser app ./app
+COPY --chown=appuser:appuser alembic ./alembic
 
 USER appuser
 

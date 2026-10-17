@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "Events Aggregator: backend service over the Events Provider API"
 requires-python = ">=3.11,<3.12"
 dependencies = [
+    "alembic>=1.13",
     "fastapi>=0.115",
+    "psycopg[binary]>=3.2",
+    "sqlalchemy>=2.0",
     "uvicorn[standard]>=0.30",
 ]
 
@@ -28,3 +31,10 @@ select = ["E", "F", "I", "B", "UP"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "postgres: needs a disposable PostgreSQL given by TEST_DATABASE_URL (skipped otherwise)",
+]
+
+[tool.ruff.lint.isort]
+# the local ./alembic migrations folder would otherwise shadow the library
+known-third-party = ["alembic"]
