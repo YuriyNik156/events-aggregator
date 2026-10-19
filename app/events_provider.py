@@ -105,8 +105,7 @@ class EventsProviderClient:
     ) -> EventsPage:
         """Fetch one page: the first (by ``changed_at``) or a ready ``next`` URL."""
         if url is not None:
-            # ``next`` may be absolute; httpx keeps absolute URLs as they are.
-            response = self._get(url)
+            response = self._get(self._next_target(url))
         else:
             params = {"changed_at": changed_at.isoformat()} if changed_at else None
             response = self._get(EVENTS_PATH, params=params)
@@ -117,6 +116,25 @@ class EventsProviderClient:
                 "Events Provider returned an invalid events page "
                 f"({exc.error_count()} validation errors)"
             ) from None
+
+    @staticmethod
+    def _next_target(url: str) -> str:
+        """Path and query of a ``next`` link, to be requested on our ``base_url``.
+
+        The scheme and host of ``next`` (public name, no port, http instead of
+        https, ...) are ignored, so the API key only ever goes to ``base_url``.
+        """
+        try:
+            parsed = httpx.URL(url)
+        except httpx.InvalidURL:
+            raise ProviderUnavailableError(
+                "Events Provider returned a bad next link"
+            ) from None
+        if parsed.path != EVENTS_PATH:
+            raise ProviderUnavailableError(
+                "Events Provider returned an unexpected next link"
+            )
+        return parsed.raw_path.decode("ascii")
 
     def _get(self, url: str, params: dict[str, str] | None = None) -> httpx.Response:
         try:

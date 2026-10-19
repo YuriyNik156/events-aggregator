@@ -36,14 +36,94 @@ def test_first_page_sends_changed_at_and_api_key():
     assert page.results[0].place.seats_pattern == "A1-10"
 
 
-def test_next_url_is_requested_as_is_with_api_key():
-    client, http = make_client(ok(provider_page([])))
+def transport_client(handler) -> tuple[EventsProviderClient, list[httpx.Request]]:
+    """Real httpx client (base_url, redirects) on a mock transport."""
+    seen: list[httpx.Request] = []
 
-    client.get_events_page(url="http://other-host/api/events/?cursor=abc")
+    def record(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return handler(request)
 
-    args, kwargs = http.get.call_args
-    assert args == ("http://other-host/api/events/?cursor=abc",)
-    assert kwargs["headers"] == {"x-api-key": "test-key"}
+    http = httpx.Client(
+        base_url="http://provider:8000",
+        transport=httpx.MockTransport(record),
+        follow_redirects=True,
+    )
+    return EventsProviderClient(
+        "http://provider:8000", "test-key", http_client=http
+    ), seen
+
+
+@pytest.mark.parametrize(
+    "next_url",
+    [
+        "http://public.example.org/api/events/?changed_at=2000-01-01&cursor=a%3D%3D",
+        "https://provider/api/events/?changed_at=2000-01-01&cursor=a%3D%3D",  # no port
+        "//evil.example.org/api/events/?changed_at=2000-01-01&cursor=a%3D%3D",
+        "/api/events/?changed_at=2000-01-01&cursor=a%3D%3D",  # relative
+    ],
+)
+def test_next_is_requested_on_base_url_keeping_query(next_url):
+    client, seen = transport_client(lambda r: ok(provider_page([])))
+
+    client.get_events_page(url=next_url)
+
+    (request,) = seen
+    assert (request.url.scheme, request.url.host, request.url.port) == (
+        "http",
+        "provider",
+        8000,
+    )
+    assert request.url.path == "/api/events/"
+    assert request.url.params["changed_at"] == "2000-01-01"
+    assert request.url.params["cursor"] == "a=="
+    assert request.headers["x-api-key"] == "test-key"
+
+
+@pytest.mark.parametrize(
+    "next_url",
+    [
+        "http://provider:8000/api/other/?cursor=a",
+        "http://provider:8000/api/events/../admin/",
+        "http://provider:8000/",
+        "http://[::1/api/events/",
+    ],
+)
+def test_unexpected_next_is_rejected_without_request(next_url):
+    client, seen = transport_client(lambda r: ok(provider_page([])))
+
+    with pytest.raises(ProviderUnavailableError) as info:
+        client.get_events_page(url=next_url)
+
+    assert seen == []
+    assert "test-key" not in str(info.value)
+
+
+def test_pages_are_collected_and_key_goes_only_to_base_host():
+    def handler(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params.get("cursor")
+        pages = {
+            None: (
+                [provider_event_json("a")],
+                "http://public.example.org/api/events/?changed_at=2000-01-01&cursor=2",
+            ),
+            "2": (
+                [provider_event_json("b")],
+                "http://public.example.org/api/events/?changed_at=2000-01-01&cursor=3",
+            ),
+            "3": ([provider_event_json("c")], None),
+        }
+        events, next_url = pages[cursor]
+        return ok(provider_page(events, next_url=next_url))
+
+    client, seen = transport_client(handler)
+
+    events = list(EventsPaginator(client, INITIAL))
+
+    assert [e.id for e in events] == ["a", "b", "c"]
+    assert {r.url.host for r in seen} == {"provider"}
+    assert all(r.headers["x-api-key"] == "test-key" for r in seen)
+    assert all(r.url.params["changed_at"] == "2000-01-01" for r in seen)
 
 
 @pytest.mark.parametrize("status", [401, 404, 500])
