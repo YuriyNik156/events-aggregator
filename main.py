@@ -11,7 +11,7 @@ from app.config import ConfigError, get_provider_settings
 from app.database import dispose_engine, get_session_factory
 from app.events_provider import EventsProviderClient, ProviderError
 from app.repositories import EventRepository
-from app.schemas import EventOut, EventsPageOut
+from app.schemas import EventDetailOut, EventOut, EventsPageOut
 from app.services import SyncAlreadyRunningError, sync_events
 
 logging.basicConfig(level=logging.INFO)
@@ -86,3 +86,11 @@ def list_events(
         previous=page_url(page - 1) if page > 1 else None,
         results=[EventOut.from_event(e) for e in events],
     )
+
+
+@app.get("/api/events/{event_id}", response_model=EventDetailOut)
+def get_event(event_id: str, session: Annotated[Session, Depends(get_session)]):
+    event = EventRepository(session).get(event_id)
+    if event is None:
+        raise HTTPException(404, "Event not found")
+    return EventDetailOut.from_event(event)

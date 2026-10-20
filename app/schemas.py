@@ -39,6 +39,24 @@ class EventOut(BaseModel):
         )
 
 
+class PlaceDetailOut(PlaceOut):
+    seats_pattern: str
+
+
+class EventDetailOut(EventOut):
+    place: PlaceDetailOut
+
+    @classmethod
+    def from_event(cls, event: Event) -> "EventDetailOut":
+        base = EventOut.from_event(event)
+        return cls(
+            **base.model_dump(exclude={"place"}),
+            place=PlaceDetailOut(
+                **base.place.model_dump(), seats_pattern=event.place_seats_pattern
+            ),
+        )
+
+
 class EventsPageOut(BaseModel):
     count: int
     next: str | None

@@ -182,3 +182,55 @@ def test_sync_trigger_without_api_key_returns_500(db, monkeypatch):
 
 def test_health_still_works(client):
     assert client.get("/api/health").json() == {"status": "ok"}
+
+
+def test_event_detail_returns_place_with_seats_pattern(client, db, provider):
+    seed(db, make_event("e1", place_seats_pattern="A1-10,B1-20"))
+
+    response = client.get("/api/events/e1")
+
+    assert response.status_code == 200
+    body = response.json()
+    # SQLite drops the UTC offset, so the date fields are checked by prefix only.
+    assert body.pop("event_time").startswith("2026-01-11T14:00:00")
+    assert body.pop("registration_deadline").startswith("2026-01-10T14:00:00")
+    assert body == {
+        "id": "e1",
+        "name": "Concert",
+        "place": {
+            "id": "p1",
+            "name": "Hall",
+            "city": "Moscow",
+            "address": "Main st. 1",
+            "seats_pattern": "A1-10,B1-20",
+        },
+        "status": "published",
+        "number_of_visitors": 0,
+    }
+    assert provider.mock_calls == []
+
+
+def test_event_detail_with_null_registration_deadline(client, db):
+    seed(db, make_event("e1", registration_deadline=None))
+
+    response = client.get("/api/events/e1")
+
+    assert response.status_code == 200
+    assert response.json()["registration_deadline"] is None
+
+
+def test_event_detail_unknown_event_returns_404(client, db, provider):
+    seed(db, make_event("e1"))
+
+    response = client.get("/api/events/missing")
+
+    assert response.status_code == 404
+    assert provider.mock_calls == []
+
+
+def test_list_still_hides_seats_pattern_after_detail_route(client, db):
+    seed(db, make_event("e1"))
+
+    place = client.get("/api/events").json()["results"][0]["place"]
+
+    assert "seats_pattern" not in place
