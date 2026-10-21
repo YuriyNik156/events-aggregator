@@ -301,3 +301,106 @@ def register_ticket(
         raise TicketNotSavedError(ticket_id) from None
     logger.info("Ticket %s registered for event %s", ticket_id, event_id)
     return ticket_id
+
+
+class TicketNotFoundError(LookupError):
+    pass
+
+
+class EventStartedError(RuntimeError):
+    pass
+
+
+class CancellationInProgressError(RuntimeError):
+    pass
+
+
+class CancellationRejectedError(RuntimeError):
+    """The provider refused with HTTP 400 (documented: e.g. the event has started)."""
+
+
+class CancellationNotSavedError(RuntimeError):
+    """The provider cancelled the registration but the local save failed."""
+
+    def __init__(self, ticket_id: str):
+        super().__init__("cancellation confirmed by the provider, not saved locally")
+        self.ticket_id = ticket_id
+
+
+# Tickets whose DELETE is in flight in this process. A second request for the same
+# ticket must not send another DELETE: the provider's idempotency is unconfirmed.
+_cancelling: set[str] = set()
+_cancelling_lock = threading.Lock()
+
+
+def cancel_ticket(
+    session: Session,
+    client: EventsProviderClient,
+    cache: SeatsCache,
+    ticket_id: str,
+    now: datetime | None = None,
+) -> None:
+    """Cancel a registration at the provider, then mark the local ticket cancelled.
+
+    The DELETE is sent once and never retried. The ticket row is kept (history);
+    only ``cancelled_at`` is set, and only after the provider confirmed.
+    """
+    # The lock comes first: the ticket is read only while holding it, so a request
+    # that waited behind a finished cancellation sees the ticket as cancelled.
+    with _cancelling_lock:
+        if ticket_id in _cancelling:
+            raise CancellationInProgressError(ticket_id)
+        _cancelling.add(ticket_id)
+    try:
+        event_id = _cancel(session, client, cache, ticket_id, now)
+    finally:
+        with _cancelling_lock:
+            _cancelling.discard(ticket_id)
+    logger.info("Ticket %s cancelled for event %s", ticket_id, event_id)
+
+
+def _cancel(
+    session: Session,
+    client: EventsProviderClient,
+    cache: SeatsCache,
+    ticket_id: str,
+    now: datetime | None,
+) -> str:
+    tickets = TicketRepository(session)
+    ticket = tickets.get_active(ticket_id)
+    if ticket is None:
+        raise TicketNotFoundError(ticket_id)
+    event_id = ticket.event_id
+    event = EventRepository(session).get(event_id)
+    if event is None:
+        raise EventNotFoundError(event_id)
+    started_at = event.event_time
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=UTC)  # drivers without tz
+    if (now or datetime.now(UTC)) >= started_at:
+        raise EventStartedError(event_id)
+
+    try:
+        client.unregister(event_id, ticket_id)
+    except ProviderRejectedError as exc:
+        if exc.status_code == 400:
+            raise CancellationRejectedError(ticket_id) from None
+        if exc.status_code == 404:
+            # The event or the registration is unknown to the provider.
+            raise TicketNotFoundError(ticket_id) from None
+        raise
+
+    # The seat is free at the provider from now on, whatever happens locally.
+    cache.invalidate(event_id)
+    try:
+        tickets.cancel(ticket, datetime.now(UTC))
+        session.commit()
+    except Exception:
+        session.rollback()
+        logger.exception(
+            "Provider cancelled ticket %s for event %s but the local save failed",
+            ticket_id,
+            event_id,
+        )
+        raise CancellationNotSavedError(ticket_id) from None
+    return event_id

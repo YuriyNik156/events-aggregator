@@ -23,15 +23,21 @@ from app.schemas import (
     TicketCreatedOut,
 )
 from app.services import (
+    CancellationInProgressError,
+    CancellationNotSavedError,
+    CancellationRejectedError,
     EventNotFoundError,
     EventNotPublishedError,
+    EventStartedError,
     InvalidSeatError,
     RegistrationClosedError,
     RegistrationRejectedError,
     SeatsCache,
     SeatUnavailableError,
     SyncAlreadyRunningError,
+    TicketNotFoundError,
     TicketNotSavedError,
+    cancel_ticket,
     get_available_seats,
     register_ticket,
     seats_cache,
@@ -187,3 +193,35 @@ def create_ticket(
         logger.warning("Registration for event %s failed: %s", body.event_id, exc)
         raise HTTPException(502, "Events Provider request failed") from None
     return TicketCreatedOut(ticket_id=ticket_id)
+
+
+@app.delete("/api/tickets/{ticket_id}")
+def delete_ticket(
+    ticket_id: str,
+    session: Annotated[Session, Depends(get_session)],
+    client: Annotated[EventsProviderClient, Depends(get_provider_client)],
+    cache: Annotated[SeatsCache, Depends(get_seats_cache)],
+):
+    try:
+        cancel_ticket(session, client, cache, ticket_id)
+    except TicketNotFoundError:
+        raise HTTPException(404, "Ticket not found") from None
+    except EventNotFoundError:
+        raise HTTPException(404, "Event not found") from None
+    except EventStartedError:
+        raise HTTPException(400, "Event has already started") from None
+    except CancellationInProgressError:
+        raise HTTPException(409, "Cancellation is already in progress") from None
+    except CancellationRejectedError:
+        raise HTTPException(409, "Events Provider rejected the cancellation") from None
+    except CancellationNotSavedError as exc:
+        raise HTTPException(
+            500,
+            "Cancellation was confirmed by Events Provider but could not be saved; "
+            f"do not retry, reference ticket_id={exc.ticket_id}",
+        ) from None
+    except ProviderError as exc:
+        # The outcome may be unknown (e.g. timeout); the ticket stays active.
+        logger.warning("Cancellation of ticket %s failed: %s", ticket_id, exc)
+        raise HTTPException(502, "Events Provider request failed") from None
+    return {"success": True}

@@ -95,6 +95,12 @@ class ProviderRegistration(BaseModel):
     ticket_id: ExternalId = Field(min_length=1)
 
 
+class ProviderUnregistration(BaseModel):
+    """``DELETE /api/events/{id}/unregister/``: ``{"success": true}``."""
+
+    success: bool
+
+
 class EventsPage(BaseModel):
     next: str | None = None
     previous: str | None = None
@@ -191,6 +197,41 @@ class EventsProviderClient:
                 "Events Provider returned an invalid registration "
                 f"({exc.error_count()} validation errors)"
             ) from None
+
+    def unregister(self, event_id: str, ticket_id: str) -> None:
+        """Cancel a registration; returns only if the provider confirmed it.
+
+        Never retried here: the provider's idempotency is not confirmed, so after a
+        timeout the outcome stays unknown and is reported as such.
+        """
+        try:
+            response = self.http_client.request(
+                "DELETE",
+                f"{EVENTS_PATH}{quote(event_id, safe='')}/unregister/",
+                json={"ticket_id": ticket_id},
+                headers={"x-api-key": self.api_key},
+                timeout=self.timeout,
+                follow_redirects=False,  # the API key must not leave ``base_url``
+            )
+        except httpx.HTTPError as exc:
+            raise ProviderUnavailableError(
+                f"Events Provider request failed: {type(exc).__name__}"
+            ) from None
+        if not response.is_success:
+            raise ProviderRejectedError(response.status_code, "")
+        try:
+            confirmed = ProviderUnregistration.model_validate_json(
+                response.content
+            ).success
+        except ValidationError as exc:
+            raise ProviderUnavailableError(
+                "Events Provider returned an invalid cancellation response "
+                f"({exc.error_count()} validation errors)"
+            ) from None
+        if confirmed is not True:
+            raise ProviderUnavailableError(
+                "Events Provider did not confirm cancellation"
+            )
 
     @staticmethod
     def _next_target(url: str) -> str:
