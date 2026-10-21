@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
@@ -85,3 +86,32 @@ def get_provider_settings() -> ProviderSettings:
         raise ConfigError("EVENTS_PROVIDER_API_KEY is not set")
     base_url = _env("EVENTS_PROVIDER_BASE_URL") or DEFAULT_EVENTS_PROVIDER_URL
     return ProviderSettings(base_url=base_url, api_key=api_key)
+
+
+def get_public_base_url() -> str | None:
+    """Externally visible origin for absolute links, or ``None`` when unset.
+
+    Behind a TLS-terminating proxy the app only sees plain HTTP, so absolute
+    links would get the wrong scheme. When ``PUBLIC_BASE_URL`` is set, its
+    scheme, host and port are used and the request's ``Host``/``X-Forwarded-*``
+    are not trusted. Only an origin is accepted (``https://host[:port]``, a
+    trailing ``/`` is fine): the app is served at the root, so a path prefix
+    would silently produce wrong links.
+    """
+    value = _env("PUBLIC_BASE_URL")
+    if not value:
+        return None
+    try:
+        parts = urlsplit(value)
+        hostname, _ = parts.hostname, parts.port  # port access validates it
+    except ValueError:
+        raise ConfigError("PUBLIC_BASE_URL is not a valid URL") from None
+    if parts.scheme not in ("http", "https") or not hostname:
+        raise ConfigError(
+            "PUBLIC_BASE_URL must look like https://host[:port] (http or https)"
+        )
+    if parts.username or parts.password or parts.query or parts.fragment:
+        raise ConfigError("PUBLIC_BASE_URL must not contain credentials, query or #")
+    if parts.path not in ("", "/"):
+        raise ConfigError("PUBLIC_BASE_URL must not contain a path prefix")
+    return f"{parts.scheme}://{parts.netloc}"

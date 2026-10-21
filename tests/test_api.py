@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 import main
+from app.config import ConfigError
 from app.events_provider import EventsPage, ProviderUnavailableError
 from app.models import Base
 from app.repositories import EventRepository
@@ -234,3 +235,102 @@ def test_list_still_hides_seats_pattern_after_detail_route(client, db):
     place = client.get("/api/events").json()["results"][0]["place"]
 
     assert "seats_pattern" not in place
+
+
+PUBLIC = "https://events.example.org"
+
+
+def seed_pages(db, n=5):
+    seed(db, *[make_event(f"e{i}") for i in range(n)])
+
+
+def test_links_use_public_base_url(client, db, monkeypatch):
+    monkeypatch.setenv("PUBLIC_BASE_URL", PUBLIC)
+    seed_pages(db)
+
+    first = client.get("/api/events", params={"page_size": 2}).json()
+    middle = client.get("/api/events", params={"page": 2, "page_size": 2}).json()
+
+    assert first["next"] == f"{PUBLIC}/api/events?page_size=2&page=2"
+    assert first["previous"] is None
+    assert middle["previous"] == f"{PUBLIC}/api/events?page_size=2&page=1"
+    assert middle["next"] == f"{PUBLIC}/api/events?page_size=2&page=3"
+
+
+def test_public_base_url_keeps_filters_without_duplicating_page(
+    client, db, monkeypatch
+):
+    monkeypatch.setenv("PUBLIC_BASE_URL", PUBLIC)
+    seed_pages(db)
+
+    body = client.get(
+        "/api/events", params={"date_from": "2020-01-01", "page": 2, "page_size": 1}
+    ).json()
+
+    for link, page in ((body["next"], "3"), (body["previous"], "1")):
+        parts = urlparse(link)
+        assert f"{parts.scheme}://{parts.netloc}" == PUBLIC
+        assert parts.path == "/api/events"
+        assert parse_qs(parts.query) == {
+            "date_from": ["2020-01-01"],
+            "page_size": ["1"],
+            "page": [page],
+        }
+
+
+def test_public_base_url_ignores_host_and_forwarded_headers(client, db, monkeypatch):
+    monkeypatch.setenv("PUBLIC_BASE_URL", PUBLIC)
+    seed_pages(db)
+
+    body = client.get(
+        "/api/events",
+        params={"page_size": 2},
+        headers={
+            "Host": "evil.example",
+            "X-Forwarded-Host": "evil.example",
+            "X-Forwarded-Proto": "http",
+        },
+    ).json()
+
+    assert body["next"].startswith(f"{PUBLIC}/api/events?")
+    assert "evil.example" not in body["next"]
+
+
+def test_public_base_url_trailing_slash_and_port(client, db, monkeypatch):
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://events.example.org:8443/")
+    seed_pages(db)
+
+    body = client.get("/api/events", params={"page_size": 2}).json()
+
+    assert (
+        body["next"] == "https://events.example.org:8443/api/events?page_size=2&page=2"
+    )
+
+
+def test_without_public_base_url_links_follow_the_request(client, db, monkeypatch):
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    seed_pages(db)
+
+    body = client.get("/api/events", params={"page_size": 2}).json()
+
+    assert body["next"] == "http://testserver/api/events?page_size=2&page=2"
+
+
+def test_http_request_is_served_without_redirect(client, db, monkeypatch):
+    monkeypatch.setenv("PUBLIC_BASE_URL", PUBLIC)
+    seed_pages(db)
+
+    response = client.get(
+        "/api/events", params={"page_size": 2}, follow_redirects=False
+    )
+
+    assert response.status_code == 200
+    assert "location" not in response.headers
+    assert set(response.json()) == {"count", "next", "previous", "results"}
+
+
+def test_invalid_public_base_url_fails_at_startup(db, monkeypatch):
+    monkeypatch.setenv("PUBLIC_BASE_URL", "events.example.org")
+
+    with pytest.raises(ConfigError), TestClient(main.app):
+        pass

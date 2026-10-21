@@ -3,6 +3,7 @@ from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, time
 from typing import Annotated
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -10,7 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from app.config import ConfigError, get_provider_settings
+from app.config import ConfigError, get_provider_settings, get_public_base_url
 from app.database import dispose_engine, get_session_factory
 from app.events_provider import EventsProviderClient, ProviderError
 from app.repositories import EventRepository
@@ -50,6 +51,10 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Fail at startup on a bad PUBLIC_BASE_URL, not with a 500 on every request.
+    public_base_url = get_public_base_url()
+    if public_base_url and public_base_url.startswith("http://"):
+        logger.warning("PUBLIC_BASE_URL is not HTTPS; fine for local runs only")
     yield
     dispose_engine()
 
@@ -121,8 +126,13 @@ def list_events(
         date_from=start, page=page, page_size=page_size
     )
 
+    public = urlsplit(get_public_base_url() or "")
+
     def page_url(number: int) -> str:
-        return str(request.url.include_query_params(page=number))
+        url = request.url.include_query_params(page=number)
+        if public.netloc:  # configured origin wins over what the proxy forwarded
+            url = url.replace(scheme=public.scheme, netloc=public.netloc)
+        return str(url)
 
     return EventsPageOut(
         count=count,

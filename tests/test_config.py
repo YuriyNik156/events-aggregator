@@ -1,7 +1,7 @@
 import pytest
 from sqlalchemy.engine import make_url
 
-from app.config import ConfigError, get_database_url
+from app.config import ConfigError, get_database_url, get_public_base_url
 
 
 def test_connection_string_has_priority(clean_db_env):
@@ -150,3 +150,43 @@ def test_engine_is_lazy_and_does_not_connect(clean_db_env):
         assert database.get_engine() is engine
     finally:
         database.dispose_engine()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("https://h.example", "https://h.example"),
+        ("https://h.example/", "https://h.example"),
+        ("  https://h.example:8443  ", "https://h.example:8443"),
+        ("http://localhost:8000", "http://localhost:8000"),
+        ("", None),
+    ],
+)
+def test_public_base_url_valid(monkeypatch, value, expected):
+    monkeypatch.setenv("PUBLIC_BASE_URL", value)
+    assert get_public_base_url() == expected
+
+
+def test_public_base_url_unset(monkeypatch):
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    assert get_public_base_url() is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "h.example",
+        "ftp://h.example",
+        "https://",
+        "https://h.example/prefix",
+        "https://h.example/?a=1",
+        "https://h.example/#x",
+        "https://user:pw@h.example",
+        "https://h.example:notaport",
+    ],
+)
+def test_public_base_url_invalid(monkeypatch, value):
+    monkeypatch.setenv("PUBLIC_BASE_URL", value)
+    with pytest.raises(ConfigError) as exc:
+        get_public_base_url()
+    assert "pw" not in str(exc.value)
