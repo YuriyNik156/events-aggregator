@@ -11,8 +11,16 @@ from app.config import ConfigError, get_provider_settings
 from app.database import dispose_engine, get_session_factory
 from app.events_provider import EventsProviderClient, ProviderError
 from app.repositories import EventRepository
-from app.schemas import EventDetailOut, EventOut, EventsPageOut
-from app.services import SyncAlreadyRunningError, sync_events
+from app.schemas import EventDetailOut, EventOut, EventsPageOut, SeatsOut
+from app.services import (
+    EventNotFoundError,
+    EventNotPublishedError,
+    SeatsCache,
+    SyncAlreadyRunningError,
+    get_available_seats,
+    seats_cache,
+    sync_events,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,6 +51,10 @@ def get_provider_client() -> Iterator[EventsProviderClient]:
         yield client
     finally:
         client.close()
+
+
+def get_seats_cache() -> SeatsCache:
+    return seats_cache
 
 
 @app.get("/api/health")
@@ -94,3 +106,22 @@ def get_event(event_id: str, session: Annotated[Session, Depends(get_session)]):
     if event is None:
         raise HTTPException(404, "Event not found")
     return EventDetailOut.from_event(event)
+
+
+@app.get("/api/events/{event_id}/seats", response_model=SeatsOut)
+def get_event_seats(
+    event_id: str,
+    session: Annotated[Session, Depends(get_session)],
+    client: Annotated[EventsProviderClient, Depends(get_provider_client)],
+    cache: Annotated[SeatsCache, Depends(get_seats_cache)],
+):
+    try:
+        seats = get_available_seats(session, client, cache, event_id)
+    except EventNotFoundError:
+        raise HTTPException(404, "Event not found") from None
+    except EventNotPublishedError:
+        raise HTTPException(400, "Event is not published") from None
+    except ProviderError as exc:
+        logger.warning("Seats request for event %s failed: %s", event_id, exc)
+        raise HTTPException(502, "Events Provider request failed") from None
+    return SeatsOut(event_id=event_id, available_seats=seats)

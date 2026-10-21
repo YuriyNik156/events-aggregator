@@ -2,6 +2,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Annotated, Any
+from urllib.parse import quote
 
 import httpx
 from pydantic import AfterValidator, BaseModel, BeforeValidator, ValidationError
@@ -76,6 +77,12 @@ class ProviderEvent(BaseModel):
         }
 
 
+class ProviderSeats(BaseModel):
+    """``GET /api/events/{id}/seats/``: free seats only."""
+
+    seats: list[str]
+
+
 class EventsPage(BaseModel):
     next: str | None = None
     previous: str | None = None
@@ -117,6 +124,20 @@ class EventsProviderClient:
                 f"({exc.error_count()} validation errors)"
             ) from None
 
+    def get_event_seats(self, event_id: str) -> list[str]:
+        """Free seats of a published event (the provider path needs the final ``/``)."""
+        # Redirects are not followed: the API key must not leave ``base_url``.
+        response = self._get(
+            f"{EVENTS_PATH}{quote(event_id, safe='')}/seats/", follow_redirects=False
+        )
+        try:
+            return ProviderSeats.model_validate_json(response.content).seats
+        except ValidationError as exc:
+            raise ProviderUnavailableError(
+                "Events Provider returned invalid seats "
+                f"({exc.error_count()} validation errors)"
+            ) from None
+
     @staticmethod
     def _next_target(url: str) -> str:
         """Path and query of a ``next`` link, to be requested on our ``base_url``.
@@ -136,13 +157,22 @@ class EventsProviderClient:
             )
         return parsed.raw_path.decode("ascii")
 
-    def _get(self, url: str, params: dict[str, str] | None = None) -> httpx.Response:
+    def _get(
+        self,
+        url: str,
+        params: dict[str, str] | None = None,
+        follow_redirects: bool | None = None,
+    ) -> httpx.Response:
+        options: dict[str, Any] = {}
+        if follow_redirects is not None:
+            options["follow_redirects"] = follow_redirects
         try:
             response = self.http_client.get(
                 url,
                 params=params,
                 headers={"x-api-key": self.api_key},
                 timeout=self.timeout,
+                **options,
             )
         except httpx.HTTPError as exc:
             raise ProviderUnavailableError(

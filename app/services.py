@@ -6,7 +6,11 @@ from datetime import UTC, date, datetime
 
 from sqlalchemy.orm import Session
 
-from app.events_provider import EventsPaginator, EventsProviderClient
+from app.events_provider import (
+    EventsPaginator,
+    EventsProviderClient,
+    ProviderRejectedError,
+)
 from app.repositories import EventRepository, SyncMetadataRepository
 
 logger = logging.getLogger(__name__)
@@ -99,3 +103,78 @@ def _record_failure(session: Session) -> None:
     except Exception:
         session.rollback()
         logger.exception("Could not record the sync error status")
+
+
+SEATS_CACHE_TTL = 30.0
+PUBLISHED = "published"
+
+
+class EventNotFoundError(LookupError):
+    pass
+
+
+class EventNotPublishedError(RuntimeError):
+    pass
+
+
+class SeatsCache:
+    """In-memory TTL cache of free seats by event id; safe to share between threads."""
+
+    def __init__(self, ttl: float = SEATS_CACHE_TTL, clock=time.monotonic):
+        self._ttl = ttl
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._items: dict[str, tuple[float, list[str]]] = {}
+
+    def get(self, event_id: str) -> list[str] | None:
+        with self._lock:
+            item = self._items.get(event_id)
+            if item is None:
+                return None
+            expires_at, seats = item
+            if self._clock() >= expires_at:
+                del self._items[event_id]
+                return None
+            return list(seats)
+
+    def set(self, event_id: str, seats: list[str]) -> None:
+        with self._lock:
+            self._items[event_id] = (self._clock() + self._ttl, list(seats))
+
+    def invalidate(self, event_id: str) -> None:
+        with self._lock:
+            self._items.pop(event_id, None)
+
+
+seats_cache = SeatsCache()
+
+
+def get_available_seats(
+    session: Session,
+    client: EventsProviderClient,
+    cache: SeatsCache,
+    event_id: str,
+) -> list[str]:
+    """Free seats of a published event; cached successes only.
+
+    The lock is never held during the provider request, so concurrent misses may
+    each fetch once; that is harmless and keeps slow requests from blocking others.
+    """
+    event = EventRepository(session).get(event_id)
+    if event is None:
+        raise EventNotFoundError(event_id)
+    if event.status != PUBLISHED:
+        raise EventNotPublishedError(event_id)
+    seats = cache.get(event_id)
+    if seats is not None:
+        return seats
+    try:
+        seats = client.get_event_seats(event_id)
+    except ProviderRejectedError as exc:
+        if exc.status_code == 404:
+            # The provider does not know an event we have locally.
+            cache.invalidate(event_id)
+            raise EventNotFoundError(event_id) from None
+        raise
+    cache.set(event_id, seats)
+    return seats
