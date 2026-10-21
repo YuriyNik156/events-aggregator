@@ -11,13 +11,26 @@ from app.config import ConfigError, get_provider_settings
 from app.database import dispose_engine, get_session_factory
 from app.events_provider import EventsProviderClient, ProviderError
 from app.repositories import EventRepository
-from app.schemas import EventDetailOut, EventOut, EventsPageOut, SeatsOut
+from app.schemas import (
+    EventDetailOut,
+    EventOut,
+    EventsPageOut,
+    SeatsOut,
+    TicketCreate,
+    TicketCreatedOut,
+)
 from app.services import (
     EventNotFoundError,
     EventNotPublishedError,
+    InvalidSeatError,
+    RegistrationClosedError,
+    RegistrationRejectedError,
     SeatsCache,
+    SeatUnavailableError,
     SyncAlreadyRunningError,
+    TicketNotSavedError,
     get_available_seats,
+    register_ticket,
     seats_cache,
     sync_events,
 )
@@ -125,3 +138,39 @@ def get_event_seats(
         logger.warning("Seats request for event %s failed: %s", event_id, exc)
         raise HTTPException(502, "Events Provider request failed") from None
     return SeatsOut(event_id=event_id, available_seats=seats)
+
+
+@app.post("/api/tickets", status_code=201, response_model=TicketCreatedOut)
+def create_ticket(
+    body: TicketCreate,
+    session: Annotated[Session, Depends(get_session)],
+    client: Annotated[EventsProviderClient, Depends(get_provider_client)],
+    cache: Annotated[SeatsCache, Depends(get_seats_cache)],
+):
+    try:
+        ticket_id = register_ticket(session, client, cache, **body.model_dump())
+    except EventNotFoundError:
+        raise HTTPException(404, "Event not found") from None
+    except EventNotPublishedError:
+        raise HTTPException(400, "Event is not published") from None
+    except RegistrationClosedError:
+        raise HTTPException(400, "Registration is closed") from None
+    except InvalidSeatError:
+        raise HTTPException(400, "Seat does not exist") from None
+    except SeatUnavailableError:
+        raise HTTPException(409, "Seat is not available") from None
+    except RegistrationRejectedError:
+        raise HTTPException(
+            409, "Events Provider rejected the registration (seat may be taken)"
+        ) from None
+    except TicketNotSavedError as exc:
+        raise HTTPException(
+            500,
+            "Registration was confirmed by Events Provider but could not be saved; "
+            f"do not retry, reference ticket_id={exc.ticket_id}",
+        ) from None
+    except ProviderError as exc:
+        # The outcome may be unknown (e.g. timeout); the message has no personal data.
+        logger.warning("Registration for event %s failed: %s", body.event_id, exc)
+        raise HTTPException(502, "Events Provider request failed") from None
+    return TicketCreatedOut(ticket_id=ticket_id)

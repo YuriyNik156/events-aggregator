@@ -5,7 +5,13 @@ from typing import Annotated, Any
 from urllib.parse import quote
 
 import httpx
-from pydantic import AfterValidator, BaseModel, BeforeValidator, ValidationError
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    Field,
+    ValidationError,
+)
 
 EVENTS_PATH = "/api/events/"
 DEFAULT_TIMEOUT = 30.0
@@ -83,6 +89,12 @@ class ProviderSeats(BaseModel):
     seats: list[str]
 
 
+class ProviderRegistration(BaseModel):
+    """``POST /api/events/{id}/register/``: the new ticket."""
+
+    ticket_id: ExternalId = Field(min_length=1)
+
+
 class EventsPage(BaseModel):
     next: str | None = None
     previous: str | None = None
@@ -135,6 +147,48 @@ class EventsProviderClient:
         except ValidationError as exc:
             raise ProviderUnavailableError(
                 "Events Provider returned invalid seats "
+                f"({exc.error_count()} validation errors)"
+            ) from None
+
+    def register(
+        self,
+        event_id: str,
+        *,
+        first_name: str,
+        last_name: str,
+        seat: str,
+        email: str,
+    ) -> str:
+        """Register a participant and return the provider's ``ticket_id``.
+
+        Never retried here: after a timeout the registration may exist already, and
+        a second POST could create another one. Errors carry no personal data.
+        """
+        try:
+            response = self.http_client.post(
+                f"{EVENTS_PATH}{quote(event_id, safe='')}/register/",
+                json={
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "seat": seat,
+                    "email": email,
+                },
+                headers={"x-api-key": self.api_key},
+                timeout=self.timeout,
+                follow_redirects=False,  # the API key must not leave ``base_url``
+            )
+        except httpx.HTTPError as exc:
+            raise ProviderUnavailableError(
+                f"Events Provider request failed: {type(exc).__name__}"
+            ) from None
+        if not response.is_success:
+            # The body may echo the participant's data, so it is not kept.
+            raise ProviderRejectedError(response.status_code, "")
+        try:
+            return ProviderRegistration.model_validate_json(response.content).ticket_id
+        except ValidationError as exc:
+            raise ProviderUnavailableError(
+                "Events Provider returned an invalid registration "
                 f"({exc.error_count()} validation errors)"
             ) from None
 

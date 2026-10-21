@@ -1,6 +1,7 @@
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel
+from pydantic import BaseModel, StringConstraints
 
 from app.models import Event
 
@@ -67,3 +68,28 @@ class EventsPageOut(BaseModel):
 class SeatsOut(BaseModel):
     event_id: str
     available_seats: list[str]
+
+
+NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+# EmailStr would need email-validator, which is not in uv.lock; a plain shape
+# check is enough because the provider has the final say.
+Email = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        pattern=r"^[^@\s]+@[^@\s.]+(\.[^@\s.]+)+$",
+        max_length=254,
+    ),
+]
+
+
+class TicketCreate(BaseModel):
+    event_id: NonEmptyStr
+    first_name: NonEmptyStr
+    last_name: NonEmptyStr
+    email: Email
+    seat: NonEmptyStr
+
+
+class TicketCreatedOut(BaseModel):
+    ticket_id: str

@@ -1,4 +1,5 @@
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ from app.events_provider import (
     EventsProviderClient,
     ProviderRejectedError,
 )
-from app.repositories import EventRepository, SyncMetadataRepository
+from app.repositories import EventRepository, SyncMetadataRepository, TicketRepository
 
 logger = logging.getLogger(__name__)
 
@@ -178,3 +179,125 @@ def get_available_seats(
         raise
     cache.set(event_id, seats)
     return seats
+
+
+class RegistrationClosedError(RuntimeError):
+    pass
+
+
+class InvalidSeatError(ValueError):
+    pass
+
+
+class SeatUnavailableError(RuntimeError):
+    pass
+
+
+class RegistrationRejectedError(RuntimeError):
+    """The provider refused with HTTP 400 (documented: e.g. the seat is taken)."""
+
+
+class TicketNotSavedError(RuntimeError):
+    """The provider registered the participant but the local save failed."""
+
+    def __init__(self, ticket_id: str):
+        super().__init__("registration confirmed by the provider, not saved locally")
+        self.ticket_id = ticket_id
+
+
+_PATTERN_SEGMENT = re.compile(r"\s*([A-Za-z]+)(\d+)(?:-(\d+))?\s*")
+_SEAT = re.compile(r"([A-Za-z]+)(\d+)")
+
+
+def seat_in_pattern(seat: str, pattern: str) -> bool:
+    """Whether ``seat`` (``A15``) fits ``pattern`` (``A1-1000,B1-2000``).
+
+    Ranges are compared, never expanded. A segment in an unknown format makes the
+    answer "maybe", i.e. True: the provider decides then.
+    """
+    parsed = _SEAT.fullmatch(seat)
+    unknown = False
+    for segment in pattern.split(","):
+        m = _PATTERN_SEGMENT.fullmatch(segment)
+        if m is None:
+            unknown = True
+            continue
+        row, first, last = m.group(1), int(m.group(2)), m.group(3)
+        if parsed and parsed.group(1) == row:
+            number = int(parsed.group(2))
+            if first <= number <= (int(last) if last else first):
+                return True
+    return unknown
+
+
+def register_ticket(
+    session: Session,
+    client: EventsProviderClient,
+    cache: SeatsCache,
+    *,
+    event_id: str,
+    first_name: str,
+    last_name: str,
+    email: str,
+    seat: str,
+    now: datetime | None = None,
+) -> str:
+    """Register a participant at the provider, then save the ticket locally.
+
+    The local checks are only a pre-filter; the provider decides. The POST is sent
+    once and never retried. No cache lock is held during the network call.
+    """
+    event = EventRepository(session).get(event_id)
+    if event is None:
+        raise EventNotFoundError(event_id)
+    if event.status != PUBLISHED:
+        raise EventNotPublishedError(event_id)
+    deadline = event.registration_deadline
+    if deadline is not None:
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)  # drivers without tz
+        if (now or datetime.now(UTC)) > deadline:
+            raise RegistrationClosedError(event_id)
+    if not seat_in_pattern(seat, event.place_seats_pattern):
+        raise InvalidSeatError(event_id)
+    if seat not in get_available_seats(session, client, cache, event_id):
+        raise SeatUnavailableError(event_id)
+
+    try:
+        ticket_id = client.register(
+            event_id,
+            first_name=first_name,
+            last_name=last_name,
+            seat=seat,
+            email=email,
+        )
+    except ProviderRejectedError as exc:
+        if exc.status_code == 400:
+            raise RegistrationRejectedError(event_id) from None
+        if exc.status_code == 404:
+            raise EventNotFoundError(event_id) from None
+        raise
+
+    # The seat is taken at the provider from now on, whatever happens locally.
+    cache.invalidate(event_id)
+    try:
+        TicketRepository(session).add(
+            ticket_id=ticket_id,
+            event_id=event_id,
+            first_name=first_name,
+            last_name=last_name,
+            email=email,
+            seat=seat,
+        )
+        session.commit()
+    except Exception:
+        session.rollback()
+        # Ids only: no names or emails in logs. Not compensated automatically.
+        logger.exception(
+            "Provider confirmed ticket %s for event %s but the local save failed",
+            ticket_id,
+            event_id,
+        )
+        raise TicketNotSavedError(ticket_id) from None
+    logger.info("Ticket %s registered for event %s", ticket_id, event_id)
+    return ticket_id
