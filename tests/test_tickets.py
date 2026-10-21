@@ -119,37 +119,37 @@ def test_no_deadline_means_open_registration(client, db):
     assert client.post("/api/tickets", json=BODY).status_code == 201
 
 
-# ---- 422 ----
+# ---- invalid body: 400 on this route (LMS contract) ----
 
 
 @pytest.mark.parametrize("field", list(BODY))
-def test_missing_field_is_422(client, db, provider, field):
+def test_missing_field_is_400(client, db, provider, field):
     seed(db)
 
     response = client.post(
         "/api/tickets", json={k: v for k, v in BODY.items() if k != field}
     )
 
-    assert response.status_code == 422
+    assert response.status_code == 400
     assert provider.mock_calls == []
 
 
 @pytest.mark.parametrize("field", list(BODY))
 @pytest.mark.parametrize("value", ["", "   "])
-def test_blank_field_is_422(client, db, provider, field, value):
+def test_blank_field_is_400(client, db, provider, field, value):
     seed(db)
 
-    assert client.post("/api/tickets", json={**BODY, field: value}).status_code == 422
+    assert client.post("/api/tickets", json={**BODY, field: value}).status_code == 400
     assert provider.mock_calls == []
 
 
 @pytest.mark.parametrize(
     "email", ["ivan", "ivan@", "@example.com", "ivan@example", "a b@example.com"]
 )
-def test_invalid_email_is_422(client, db, provider, email):
+def test_invalid_email_is_400(client, db, provider, email):
     seed(db)
 
-    assert client.post("/api/tickets", json={**BODY, "email": email}).status_code == 422
+    assert client.post("/api/tickets", json={**BODY, "email": email}).status_code == 400
     assert provider.mock_calls == []
 
 
@@ -485,3 +485,29 @@ def test_active_ticket_id_cannot_be_registered_twice(db):
 
     with pytest.raises(IntegrityError):
         repo.add(ticket_id="T", seat="A2", **fields)
+
+
+def test_invalid_body_error_does_not_echo_input(client, db):
+    seed(db)
+
+    response = client.post("/api/tickets", json={**BODY, "email": "secret-not-email"})
+
+    assert response.status_code == 400
+    assert "secret-not-email" not in response.text
+    assert response.json()["detail"][0]["loc"] == ["body", "email"]
+
+
+def test_malformed_json_is_400(client, db, provider):
+    seed(db)
+
+    response = client.post(
+        "/api/tickets", content="{oops", headers={"content-type": "application/json"}
+    )
+
+    assert response.status_code == 400
+    assert provider.mock_calls == []
+
+
+def test_other_endpoints_keep_422(client):
+    assert client.get("/api/events?page=0").status_code == 422
+    assert client.get("/api/events?page=abc").status_code == 422
