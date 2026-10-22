@@ -1,30 +1,40 @@
-from sqlalchemy import Engine, create_engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
-from app.config import get_database_url
+from app.config import get_async_database_url
 
-_engine: Engine | None = None
-_session_factory: sessionmaker[Session] | None = None
+# Alembic has a synchronous engine of its own (alembic/env.py); the application
+# only uses the async one below.
+_async_engine: AsyncEngine | None = None
+_async_session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
-def get_engine() -> Engine:
+def get_async_engine() -> AsyncEngine:
     """Create the engine lazily; no connection is opened until first use."""
-    global _engine
-    if _engine is None:
-        _engine = create_engine(get_database_url(), pool_pre_ping=True)
-    return _engine
+    global _async_engine
+    if _async_engine is None:
+        _async_engine = create_async_engine(
+            get_async_database_url(), pool_pre_ping=True
+        )
+    return _async_engine
 
 
-def get_session_factory() -> sessionmaker[Session]:
-    global _session_factory
-    if _session_factory is None:
-        _session_factory = sessionmaker(get_engine(), expire_on_commit=False)
-    return _session_factory
+def get_async_session_factory() -> async_sessionmaker[AsyncSession]:
+    global _async_session_factory
+    if _async_session_factory is None:
+        _async_session_factory = async_sessionmaker(
+            get_async_engine(), expire_on_commit=False
+        )
+    return _async_session_factory
 
 
-def dispose_engine() -> None:
-    global _engine, _session_factory
-    if _engine is not None:
-        _engine.dispose()
-    _engine = None
-    _session_factory = None
+async def dispose_async_engine() -> None:
+    global _async_engine, _async_session_factory
+    if _async_engine is not None:
+        await _async_engine.dispose()
+    _async_engine = None
+    _async_session_factory = None

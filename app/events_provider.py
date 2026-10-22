@@ -1,4 +1,4 @@
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Annotated, Any
@@ -12,6 +12,8 @@ from pydantic import (
     Field,
     ValidationError,
 )
+
+from app.config import get_provider_settings
 
 EVENTS_PATH = "/api/events/"
 DEFAULT_TIMEOUT = 30.0
@@ -107,33 +109,58 @@ class EventsPage(BaseModel):
     results: list[ProviderEvent]
 
 
+def _next_target(url: str) -> str:
+    """Path and query of a ``next`` link, to be requested on our ``base_url``.
+
+    The scheme and host of ``next`` (public name, no port, http instead of
+    https, ...) are ignored, so the API key only ever goes to ``base_url``.
+    """
+    try:
+        parsed = httpx.URL(url)
+    except httpx.InvalidURL:
+        raise ProviderUnavailableError(
+            "Events Provider returned a bad next link"
+        ) from None
+    if parsed.path != EVENTS_PATH:
+        raise ProviderUnavailableError(
+            "Events Provider returned an unexpected next link"
+        )
+    return parsed.raw_path.decode("ascii")
+
+
 @dataclass
 class EventsProviderClient:
-    """All HTTP traffic to the Events Provider lives here."""
+    """All HTTP traffic to the Events Provider lives here.
+
+    Redirects are never followed, whatever the ``http_client`` was built with:
+    the API key must not leave ``base_url``. Nothing is retried here.
+    """
 
     base_url: str
     api_key: str
     timeout: float = DEFAULT_TIMEOUT
-    http_client: httpx.Client | None = None
+    http_client: httpx.AsyncClient | None = None
 
     def __post_init__(self) -> None:
         if self.http_client is None:
-            self.http_client = httpx.Client(
-                base_url=self.base_url, timeout=self.timeout, follow_redirects=True
+            self.http_client = httpx.AsyncClient(
+                base_url=self.base_url, timeout=self.timeout, follow_redirects=False
             )
 
-    def close(self) -> None:
-        self.http_client.close()
+    async def aclose(self) -> None:
+        await self.http_client.aclose()
 
-    def get_events_page(
+    async def get_events_page(
         self, *, changed_at: date | None = None, url: str | None = None
     ) -> EventsPage:
         """Fetch one page: the first (by ``changed_at``) or a ready ``next`` URL."""
         if url is not None:
-            response = self._get(self._next_target(url))
+            response = await self._request("GET", _next_target(url), error_body=True)
         else:
             params = {"changed_at": changed_at.isoformat()} if changed_at else None
-            response = self._get(EVENTS_PATH, params=params)
+            response = await self._request(
+                "GET", EVENTS_PATH, params=params, error_body=True
+            )
         try:
             return EventsPage.model_validate_json(response.content)
         except ValidationError as exc:
@@ -142,11 +169,10 @@ class EventsProviderClient:
                 f"({exc.error_count()} validation errors)"
             ) from None
 
-    def get_event_seats(self, event_id: str) -> list[str]:
+    async def get_event_seats(self, event_id: str) -> list[str]:
         """Free seats of a published event (the provider path needs the final ``/``)."""
-        # Redirects are not followed: the API key must not leave ``base_url``.
-        response = self._get(
-            f"{EVENTS_PATH}{quote(event_id, safe='')}/seats/", follow_redirects=False
+        response = await self._request(
+            "GET", f"{EVENTS_PATH}{quote(event_id, safe='')}/seats/", error_body=True
         )
         try:
             return ProviderSeats.model_validate_json(response.content).seats
@@ -156,7 +182,7 @@ class EventsProviderClient:
                 f"({exc.error_count()} validation errors)"
             ) from None
 
-    def register(
+    async def register(
         self,
         event_id: str,
         *,
@@ -170,26 +196,16 @@ class EventsProviderClient:
         Never retried here: after a timeout the registration may exist already, and
         a second POST could create another one. Errors carry no personal data.
         """
-        try:
-            response = self.http_client.post(
-                f"{EVENTS_PATH}{quote(event_id, safe='')}/register/",
-                json={
-                    "first_name": first_name,
-                    "last_name": last_name,
-                    "seat": seat,
-                    "email": email,
-                },
-                headers={"x-api-key": self.api_key},
-                timeout=self.timeout,
-                follow_redirects=False,  # the API key must not leave ``base_url``
-            )
-        except httpx.HTTPError as exc:
-            raise ProviderUnavailableError(
-                f"Events Provider request failed: {type(exc).__name__}"
-            ) from None
-        if not response.is_success:
-            # The body may echo the participant's data, so it is not kept.
-            raise ProviderRejectedError(response.status_code, "")
+        response = await self._request(
+            "POST",
+            f"{EVENTS_PATH}{quote(event_id, safe='')}/register/",
+            json={
+                "first_name": first_name,
+                "last_name": last_name,
+                "seat": seat,
+                "email": email,
+            },
+        )
         try:
             return ProviderRegistration.model_validate_json(response.content).ticket_id
         except ValidationError as exc:
@@ -198,27 +214,17 @@ class EventsProviderClient:
                 f"({exc.error_count()} validation errors)"
             ) from None
 
-    def unregister(self, event_id: str, ticket_id: str) -> None:
+    async def unregister(self, event_id: str, ticket_id: str) -> None:
         """Cancel a registration; returns only if the provider confirmed it.
 
         Never retried here: the provider's idempotency is not confirmed, so after a
         timeout the outcome stays unknown and is reported as such.
         """
-        try:
-            response = self.http_client.request(
-                "DELETE",
-                f"{EVENTS_PATH}{quote(event_id, safe='')}/unregister/",
-                json={"ticket_id": ticket_id},
-                headers={"x-api-key": self.api_key},
-                timeout=self.timeout,
-                follow_redirects=False,  # the API key must not leave ``base_url``
-            )
-        except httpx.HTTPError as exc:
-            raise ProviderUnavailableError(
-                f"Events Provider request failed: {type(exc).__name__}"
-            ) from None
-        if not response.is_success:
-            raise ProviderRejectedError(response.status_code, "")
+        response = await self._request(
+            "DELETE",
+            f"{EVENTS_PATH}{quote(event_id, safe='')}/unregister/",
+            json={"ticket_id": ticket_id},
+        )
         try:
             confirmed = ProviderUnregistration.model_validate_json(
                 response.content
@@ -233,62 +239,77 @@ class EventsProviderClient:
                 "Events Provider did not confirm cancellation"
             )
 
-    @staticmethod
-    def _next_target(url: str) -> str:
-        """Path and query of a ``next`` link, to be requested on our ``base_url``.
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        error_body: bool = False,
+        params: dict[str, str] | None = None,
+        json: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        """One request; a non-2xx answer (3xx included) is ``ProviderRejectedError``.
 
-        The scheme and host of ``next`` (public name, no port, http instead of
-        https, ...) are ignored, so the API key only ever goes to ``base_url``.
+        ``error_body`` keeps the response text in that error. It is off for
+        register/unregister, whose answers may echo the participant's data.
         """
         try:
-            parsed = httpx.URL(url)
-        except httpx.InvalidURL:
-            raise ProviderUnavailableError(
-                "Events Provider returned a bad next link"
-            ) from None
-        if parsed.path != EVENTS_PATH:
-            raise ProviderUnavailableError(
-                "Events Provider returned an unexpected next link"
-            )
-        return parsed.raw_path.decode("ascii")
-
-    def _get(
-        self,
-        url: str,
-        params: dict[str, str] | None = None,
-        follow_redirects: bool | None = None,
-    ) -> httpx.Response:
-        options: dict[str, Any] = {}
-        if follow_redirects is not None:
-            options["follow_redirects"] = follow_redirects
-        try:
-            response = self.http_client.get(
+            response = await self.http_client.request(
+                method,
                 url,
                 params=params,
+                json=json,
                 headers={"x-api-key": self.api_key},
                 timeout=self.timeout,
-                **options,
+                follow_redirects=False,  # the API key must not leave ``base_url``
             )
         except httpx.HTTPError as exc:
             raise ProviderUnavailableError(
                 f"Events Provider request failed: {type(exc).__name__}"
             ) from None
         if not response.is_success:
-            raise ProviderRejectedError(response.status_code, response.text)
+            raise ProviderRejectedError(
+                response.status_code, response.text if error_body else ""
+            )
         return response
 
 
 class EventsPaginator:
-    """Iterate over every event of every page, following the provider's ``next``."""
+    """Iterate (``async for``) over every event of every page, following ``next``.
+
+    Pages are fetched one after another, only when the previous one is consumed.
+    """
 
     def __init__(self, client: EventsProviderClient, changed_at: date):
         self.client = client
         self.changed_at = changed_at
 
-    def __iter__(self) -> Iterator[ProviderEvent]:
-        page = self.client.get_events_page(changed_at=self.changed_at)
+    async def __aiter__(self) -> AsyncIterator[ProviderEvent]:
+        page = await self.client.get_events_page(changed_at=self.changed_at)
         while True:
-            yield from page.results
+            for event in page.results:
+                yield event
             if not page.next:
                 return
-            page = self.client.get_events_page(url=page.next)
+            page = await self.client.get_events_page(url=page.next)
+
+
+# The one client of the process: the routes and the background sync share it, and
+# with it its HTTP connections. Created on first use, closed at shutdown.
+_shared_client: EventsProviderClient | None = None
+
+
+def get_shared_client() -> EventsProviderClient:
+    """The process-wide client; ``ConfigError`` while the API key is missing."""
+    global _shared_client
+    if _shared_client is None:
+        settings = get_provider_settings()
+        _shared_client = EventsProviderClient(settings.base_url, settings.api_key)
+    return _shared_client
+
+
+async def close_shared_client() -> None:
+    global _shared_client
+    client, _shared_client = _shared_client, None
+    if client is not None:
+        await client.aclose()

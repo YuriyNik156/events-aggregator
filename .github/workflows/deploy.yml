@@ -11,6 +11,30 @@ jobs:
     permissions:
       contents: read
 
+    # A disposable PostgreSQL that exists only for this job. The credentials are
+    # throwaway test values, not secrets: the database is reachable from this
+    # runner only and is destroyed with it. The tests refuse any database whose
+    # name does not end in "_test".
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: events_test
+          POSTGRES_PASSWORD: events_test_password
+          POSTGRES_DB: events_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U events_test -d events_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgresql://events_test:events_test_password@localhost:5432/events_test
+      # Without a database the PostgreSQL tests would be skipped; here that fails.
+      REQUIRE_POSTGRES_TESTS: "1"
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -34,8 +58,13 @@ jobs:
       - name: Ruff format check
         run: uv run ruff format --check .
 
-      - name: Run tests
-        run: uv run pytest
+      - name: Apply migrations to the test database (as the container does)
+        run: uv run alembic upgrade head
+        env:
+          POSTGRES_CONNECTION_STRING: ${{ env.TEST_DATABASE_URL }}
+
+      - name: Run tests (PostgreSQL integration tests included)
+        run: uv run pytest -rs
 
   build:
     needs: check

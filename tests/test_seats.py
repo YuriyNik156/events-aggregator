@@ -1,22 +1,15 @@
-from unittest.mock import Mock
+from unittest.mock import AsyncMock
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
 
 import main
 from app.events_provider import (
-    EventsProviderClient,
     ProviderRejectedError,
     ProviderUnavailableError,
 )
-from app.models import Base
-from app.repositories import EventRepository
 from app.services import SeatsCache
-from tests.conftest import make_event
+from tests.conftest import make_event, session_override, store_event
 
 SECRET = "super-secret-key"
 
@@ -35,19 +28,8 @@ def clock() -> FakeClock:
 
 
 @pytest.fixture
-def db():
-    engine = create_engine(
-        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
-    )
-    Base.metadata.create_all(engine)
-    with Session(engine) as s:
-        yield s
-    engine.dispose()
-
-
-@pytest.fixture
-def provider() -> Mock:
-    return Mock()
+def provider() -> AsyncMock:
+    return AsyncMock()
 
 
 @pytest.fixture
@@ -57,7 +39,7 @@ def cache(clock) -> SeatsCache:
 
 @pytest.fixture
 def client(db, provider, cache):
-    main.app.dependency_overrides[main.get_session] = lambda: db
+    main.app.dependency_overrides[main.get_session] = session_override(db)
     main.app.dependency_overrides[main.get_provider_client] = lambda: provider
     main.app.dependency_overrides[main.get_seats_cache] = lambda: cache
     yield TestClient(main.app)
@@ -65,9 +47,8 @@ def client(db, provider, cache):
 
 
 def seed(db, *events: dict) -> None:
-    repo = EventRepository(db)
     for e in events:
-        repo.upsert(e)
+        store_event(db, e)
     db.commit()
 
 
@@ -178,95 +159,3 @@ def test_invalidate_resets_entry(client, db, provider, cache):
     assert cache.get("e1") is None
     assert cache.get("e2") == ["A1"]
     cache.invalidate("unknown")  # no error
-
-
-# ---- provider client ----
-
-
-def transport_client(handler):
-    seen: list[httpx.Request] = []
-
-    def record(request: httpx.Request) -> httpx.Response:
-        seen.append(request)
-        return handler(request)
-
-    http = httpx.Client(
-        base_url="http://provider:8000",
-        transport=httpx.MockTransport(record),
-        follow_redirects=True,
-    )
-    return EventsProviderClient("http://provider:8000", SECRET, http_client=http), seen
-
-
-def test_client_requests_trailing_slash_path_with_api_key():
-    client, seen = transport_client(
-        lambda r: httpx.Response(200, json={"seats": ["A1"]})
-    )
-
-    assert client.get_event_seats("550e8400-e29b-41d4-a716-446655440000") == ["A1"]
-
-    assert seen[0].url.path == "/api/events/550e8400-e29b-41d4-a716-446655440000/seats/"
-    assert seen[0].headers["x-api-key"] == SECRET
-
-
-def test_client_quotes_event_id():
-    client, seen = transport_client(lambda r: httpx.Response(200, json={"seats": []}))
-
-    client.get_event_seats("a/../b")
-
-    assert seen[0].url.raw_path == b"/api/events/a%2F..%2Fb/seats/"
-
-
-@pytest.mark.parametrize("status", [401, 404, 429, 500, 503])
-def test_client_rejection_has_status_and_no_key(status):
-    client, _ = transport_client(
-        lambda r: httpx.Response(status, text="<html>x</html>")
-    )
-
-    with pytest.raises(ProviderRejectedError) as info:
-        client.get_event_seats("e1")
-
-    assert info.value.status_code == status
-    assert SECRET not in str(info.value) + info.value.body
-
-
-@pytest.mark.parametrize(
-    "response",
-    [
-        httpx.Response(200, text="<html>UnexpectedEventStatus</html>"),
-        httpx.Response(200, text="{not json"),
-        httpx.Response(200, json={"seats": "A1"}),
-        httpx.Response(200, json={"other": []}),
-        httpx.Response(200, json={"seats": [1, 2]}),
-    ],
-)
-def test_client_invalid_body_is_unavailable(response):
-    client, _ = transport_client(lambda r: response)
-
-    with pytest.raises(ProviderUnavailableError) as info:
-        client.get_event_seats("e1")
-
-    assert SECRET not in str(info.value)
-
-
-def test_client_timeout_has_no_key():
-    def boom(request):
-        raise httpx.ReadTimeout("timeout", request=request)
-
-    client, _ = transport_client(boom)
-
-    with pytest.raises(ProviderUnavailableError) as info:
-        client.get_event_seats("e1")
-
-    assert SECRET not in str(info.value)
-
-
-def test_client_does_not_follow_redirect_with_api_key():
-    client, seen = transport_client(
-        lambda r: httpx.Response(302, headers={"location": "http://evil.example/x"})
-    )
-
-    with pytest.raises(ProviderRejectedError):
-        client.get_event_seats("e1")
-
-    assert [r.url.host for r in seen] == ["provider"]

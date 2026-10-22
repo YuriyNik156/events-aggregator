@@ -1,53 +1,39 @@
 from collections.abc import Iterator
 from datetime import UTC, datetime
-from unittest.mock import Mock
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
-from sqlalchemy.pool import StaticPool
 
 import main
 from app.config import ConfigError
 from app.events_provider import EventsPage, ProviderUnavailableError
-from app.models import Base
-from app.repositories import EventRepository
-from tests.conftest import make_event, provider_event_json, provider_page
+from tests.conftest import (
+    make_event,
+    provider_event_json,
+    provider_page,
+    session_override,
+    store_event,
+)
 
 
 @pytest.fixture
-def db() -> Iterator[Session]:
-    # One shared connection: TestClient runs sync endpoints in another thread.
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    Base.metadata.create_all(engine)
-    with Session(engine) as s:
-        yield s
-    engine.dispose()
-
-
-@pytest.fixture
-def provider() -> Mock:
-    return Mock()
+def provider() -> AsyncMock:
+    return AsyncMock()
 
 
 @pytest.fixture
 def client(db, provider) -> Iterator[TestClient]:
-    main.app.dependency_overrides[main.get_session] = lambda: db
+    main.app.dependency_overrides[main.get_session] = session_override(db)
     main.app.dependency_overrides[main.get_provider_client] = lambda: provider
     yield TestClient(main.app)
     main.app.dependency_overrides.clear()
 
 
 def seed(db, *events: dict) -> None:
-    repo = EventRepository(db)
     for e in events:
-        repo.upsert(e)
+        store_event(db, e)
     db.commit()
 
 
@@ -171,7 +157,7 @@ def test_sync_trigger_provider_failure_returns_502(client, provider):
 
 def test_sync_trigger_without_api_key_returns_500(db, monkeypatch):
     monkeypatch.delenv("EVENTS_PROVIDER_API_KEY", raising=False)
-    main.app.dependency_overrides[main.get_session] = lambda: db
+    main.app.dependency_overrides[main.get_session] = session_override(db)
     try:
         response = TestClient(main.app).post("/api/sync/trigger")
     finally:
