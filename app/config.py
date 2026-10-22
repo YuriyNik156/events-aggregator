@@ -115,3 +115,29 @@ def get_public_base_url() -> str | None:
     if parts.path not in ("", "/"):
         raise ConfigError("PUBLIC_BASE_URL must not contain a path prefix")
     return f"{parts.scheme}://{parts.netloc}"
+
+
+DEFAULT_SYNC_INTERVAL = 24 * 60 * 60
+MIN_SYNC_INTERVAL = 60
+
+
+def get_sync_interval() -> int:
+    """Seconds between background syncs; ``0`` turns the background worker off.
+
+    ``SYNC_INTERVAL_SECONDS`` defaults to 24 hours. A positive value below
+    ``MIN_SYNC_INTERVAL`` is refused so the provider is not polled in a tight loop.
+    """
+    value = _env("SYNC_INTERVAL_SECONDS")
+    if not value:
+        return DEFAULT_SYNC_INTERVAL
+    try:
+        seconds = int(value)
+    except ValueError:
+        raise ConfigError("SYNC_INTERVAL_SECONDS must be an integer") from None
+    if seconds < 0:
+        raise ConfigError("SYNC_INTERVAL_SECONDS must not be negative")
+    if 0 < seconds < MIN_SYNC_INTERVAL:
+        raise ConfigError(
+            f"SYNC_INTERVAL_SECONDS must be 0 (off) or at least {MIN_SYNC_INTERVAL}"
+        )
+    return seconds

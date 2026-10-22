@@ -11,7 +11,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from app.config import ConfigError, get_provider_settings, get_public_base_url
+from app.config import (
+    DEFAULT_SYNC_INTERVAL,
+    ConfigError,
+    get_provider_settings,
+    get_public_base_url,
+    get_sync_interval,
+)
 from app.database import dispose_engine, get_session_factory
 from app.events_provider import EventsProviderClient, ProviderError
 from app.repositories import EventRepository
@@ -44,6 +50,7 @@ from app.services import (
     seats_cache,
     sync_events,
 )
+from app.sync_worker import SyncWorker
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -55,7 +62,24 @@ async def lifespan(_: FastAPI):
     public_base_url = get_public_base_url()
     if public_base_url and public_base_url.startswith("http://"):
         logger.warning("PUBLIC_BASE_URL is not HTTPS; fine for local runs only")
+    sync_interval = get_sync_interval()  # also fails at startup when invalid
+    worker: SyncWorker | None = None
+    if sync_interval == 0:
+        logger.info("Background sync is off (SYNC_INTERVAL_SECONDS=0)")
+    else:
+        if sync_interval > DEFAULT_SYNC_INTERVAL:
+            logger.warning(
+                "SYNC_INTERVAL_SECONDS=%d is above 24 hours: "
+                "the daily sync requirement is not met",
+                sync_interval,
+            )
+        worker = SyncWorker(sync_interval)
+        worker.start()
     yield
+    if worker is not None and not await worker.stop():
+        # The sync thread still uses the engine and ends after its current request.
+        logger.warning("Background sync is still stopping; the engine is not disposed")
+        return
     dispose_engine()
 
 

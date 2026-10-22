@@ -28,6 +28,12 @@ def clean_db_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     return monkeypatch
 
 
+@pytest.fixture(autouse=True)
+def background_sync_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests never start the background worker (and so never reach a provider)."""
+    monkeypatch.setenv("SYNC_INTERVAL_SECONDS", "0")
+
+
 @pytest.fixture
 def alembic_config() -> Config:
     return Config(str(ROOT / "alembic.ini"))

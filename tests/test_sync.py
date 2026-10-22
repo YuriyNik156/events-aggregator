@@ -1,3 +1,4 @@
+import threading
 from datetime import UTC, date, datetime
 from unittest.mock import Mock
 
@@ -7,7 +8,12 @@ from sqlalchemy import func, select
 from app.events_provider import EventsPage, ProviderUnavailableError
 from app.models import Event
 from app.repositories import EventRepository, SyncMetadataRepository
-from app.services import SyncAlreadyRunningError, _sync_lock, sync_events
+from app.services import (
+    SyncAlreadyRunningError,
+    SyncStoppedError,
+    _sync_lock,
+    sync_events,
+)
 from tests.conftest import INITIAL, provider_event_json, provider_page
 
 
@@ -143,3 +149,46 @@ def test_parallel_sync_is_refused(session):
         client.get_events_page.assert_not_called()
     finally:
         _sync_lock.release()
+
+
+def test_stop_before_start_changes_nothing(session):
+    sync_events(session, client_with(page(provider_event_json("e1"))))
+    before = stored_cursor(session)
+    stop = threading.Event()
+    stop.set()
+    newer = provider_event_json("e2", changed_at="2026-03-01T00:00:00+00:00")
+
+    with pytest.raises(SyncStoppedError):
+        sync_events(session, client_with(page(newer)), stop)
+
+    assert event_count(session) == 1
+    assert stored_cursor(session) == before
+    assert SyncMetadataRepository(session).get().sync_status == "success"  # not error
+
+
+def test_stop_between_events_rolls_back(session, monkeypatch):
+    stop = threading.Event()
+    upsert = EventRepository.upsert
+
+    def upsert_then_stop(self, data):
+        result = upsert(self, data)
+        stop.set()  # as if shutdown began while the first event was saved
+        return result
+
+    monkeypatch.setattr(EventRepository, "upsert", upsert_then_stop)
+    client = client_with(page(provider_event_json("e1"), provider_event_json("e2")))
+
+    with pytest.raises(SyncStoppedError):
+        sync_events(session, client, stop)
+
+    assert event_count(session) == 0
+    assert SyncMetadataRepository(session).get() is None  # no error row either
+    assert not _sync_lock.locked()
+
+
+def test_unset_stop_does_not_change_the_sync(session):
+    result = sync_events(
+        session, client_with(page(provider_event_json("e1"))), threading.Event()
+    )
+
+    assert result.processed == 1

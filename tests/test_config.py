@@ -1,7 +1,12 @@
 import pytest
 from sqlalchemy.engine import make_url
 
-from app.config import ConfigError, get_database_url, get_public_base_url
+from app.config import (
+    ConfigError,
+    get_database_url,
+    get_public_base_url,
+    get_sync_interval,
+)
 
 
 def test_connection_string_has_priority(clean_db_env):
@@ -190,3 +195,34 @@ def test_public_base_url_invalid(monkeypatch, value):
     with pytest.raises(ConfigError) as exc:
         get_public_base_url()
     assert "pw" not in str(exc.value)
+
+
+def test_sync_interval_defaults_to_24_hours(monkeypatch):
+    monkeypatch.delenv("SYNC_INTERVAL_SECONDS", raising=False)
+
+    assert get_sync_interval() == 86400
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", 86400),
+        ("  ", 86400),
+        ("0", 0),
+        ("60", 60),
+        (" 3600 ", 3600),
+        ("172800", 172800),
+    ],
+)
+def test_sync_interval_accepts(monkeypatch, value, expected):
+    monkeypatch.setenv("SYNC_INTERVAL_SECONDS", value)
+
+    assert get_sync_interval() == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "1", "59", "abc", "1.5", "1h"])
+def test_sync_interval_rejects(monkeypatch, value):
+    monkeypatch.setenv("SYNC_INTERVAL_SECONDS", value)
+
+    with pytest.raises(ConfigError, match="SYNC_INTERVAL_SECONDS"):
+        get_sync_interval()

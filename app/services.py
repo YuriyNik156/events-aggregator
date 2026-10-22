@@ -29,28 +29,42 @@ class SyncAlreadyRunningError(RuntimeError):
     pass
 
 
+class SyncStoppedError(RuntimeError):
+    """The sync was stopped on request (shutdown); nothing was saved."""
+
+
 @dataclass(frozen=True)
 class SyncResult:
     processed: int
     changed_at_cursor: date
 
 
-def sync_events(session: Session, client: EventsProviderClient) -> SyncResult:
+def sync_events(
+    session: Session,
+    client: EventsProviderClient,
+    stop: threading.Event | None = None,
+) -> SyncResult:
     """Pull changed events from the provider and upsert them.
 
     Events and the new cursor are saved in one transaction, so a failure at any
-    point leaves both as they were. Safe to call again later (manual trigger now,
-    a background worker in the future).
+    point leaves both as they were. Safe to call again later (manual trigger and
+    the background worker both call it).
+
+    ``stop`` (set by the worker on shutdown) is checked between events: the
+    transaction is then rolled back and ``SyncStoppedError`` raised. A request to
+    the provider that is already in flight is not interrupted.
     """
     if not _sync_lock.acquire(blocking=False):
         raise SyncAlreadyRunningError("synchronization is already running")
     try:
-        return _sync(session, client)
+        return _sync(session, client, stop)
     finally:
         _sync_lock.release()
 
 
-def _sync(session: Session, client: EventsProviderClient) -> SyncResult:
+def _sync(
+    session: Session, client: EventsProviderClient, stop: threading.Event | None
+) -> SyncResult:
     events = EventRepository(session)
     metadata = SyncMetadataRepository(session)
     saved = metadata.get()
@@ -66,10 +80,14 @@ def _sync(session: Session, client: EventsProviderClient) -> SyncResult:
         processed = 0
         newest: datetime | None = None
         for item in EventsPaginator(client, changed_at=cursor):
+            if stop is not None and stop.is_set():
+                raise SyncStoppedError
             events.upsert(item.to_row())
             processed += 1
             if newest is None or item.changed_at > newest:
                 newest = item.changed_at
+        if stop is not None and stop.is_set():
+            raise SyncStoppedError
         if newest is not None and stored_cursor is not None:
             newest = max(newest, stored_cursor)
         metadata.save(
@@ -78,6 +96,11 @@ def _sync(session: Session, client: EventsProviderClient) -> SyncResult:
             last_changed_at=newest,  # None (no events) keeps the old cursor
         )
         session.commit()
+    except SyncStoppedError:
+        # Not a failure: the status and the cursor stay as they were.
+        session.rollback()
+        logger.info("Sync stopped on request after %.2fs", time.monotonic() - started)
+        raise
     except Exception:
         session.rollback()
         logger.exception(
