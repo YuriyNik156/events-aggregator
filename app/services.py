@@ -1,3 +1,14 @@
+"""Business rules: event synchronization, free seats, ticket registration and
+cancellation. Everything that waits (the database, the provider) is ``await``-ed.
+
+Transactions: the services own them (repositories only flush). The rule for every
+operation that talks to the provider is *read, release, call, then write*: the
+connection goes back to the pool before the provider is asked, and the result is
+saved in a new transaction. Only ``sync_events`` keeps one transaction for its whole
+run, because the events and the cursor must be saved together.
+"""
+
+import asyncio
 import logging
 import re
 import threading
@@ -5,7 +16,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.events_provider import (
     EventsPaginator,
@@ -20,9 +31,11 @@ INITIAL_CURSOR = date(2000, 1, 1)
 STATUS_SUCCESS = "success"
 STATUS_ERROR = "error"
 
-# One process, one sync at a time (DESIGN 8.5). Non-blocking: a second caller is
-# told so instead of queueing. A threading lock because the sync is blocking code.
-_sync_lock = threading.Lock()
+# One process, one sync at a time (DESIGN 8.5), for the manual trigger and the
+# background worker alike. Non-blocking: a second caller is told so instead of
+# queueing. A plain flag is enough: there is no ``await`` between the check and the
+# assignment, so in one event loop nobody can slip in between.
+_sync_running = False
 
 
 class SyncAlreadyRunningError(RuntimeError):
@@ -39,10 +52,23 @@ class SyncResult:
     changed_at_cursor: date
 
 
-def sync_events(
-    session: Session,
+async def _rollback(session: AsyncSession) -> None:
+    """Roll back, and let it finish even if this task is cancelled meanwhile."""
+    await asyncio.shield(session.rollback())
+
+
+async def _rollback_after_cancel(session: AsyncSession) -> None:
+    """Undo what a cancelled task left open; a failure here is only logged."""
+    try:
+        await _rollback(session)
+    except Exception:
+        logger.exception("Rollback after cancellation failed")
+
+
+async def sync_events(
+    session: AsyncSession,
     client: EventsProviderClient,
-    stop: threading.Event | None = None,
+    stop: asyncio.Event | None = None,
 ) -> SyncResult:
     """Pull changed events from the provider and upsert them.
 
@@ -51,23 +77,27 @@ def sync_events(
     the background worker both call it).
 
     ``stop`` (set by the worker on shutdown) is checked between events: the
-    transaction is then rolled back and ``SyncStoppedError`` raised. A request to
-    the provider that is already in flight is not interrupted.
+    transaction is then rolled back and ``SyncStoppedError`` raised. If the task is
+    cancelled instead, the transaction is rolled back too and the cancellation goes on.
     """
-    if not _sync_lock.acquire(blocking=False):
+    global _sync_running
+    if _sync_running:
         raise SyncAlreadyRunningError("synchronization is already running")
+    _sync_running = True
     try:
-        return _sync(session, client, stop)
+        return await _sync(session, client, stop)
     finally:
-        _sync_lock.release()
+        _sync_running = False
 
 
-def _sync(
-    session: Session, client: EventsProviderClient, stop: threading.Event | None
+async def _sync(
+    session: AsyncSession,
+    client: EventsProviderClient,
+    stop: asyncio.Event | None,
 ) -> SyncResult:
     events = EventRepository(session)
     metadata = SyncMetadataRepository(session)
-    saved = metadata.get()
+    saved = await metadata.get()
     stored_cursor = saved.last_changed_at if saved else None
     if stored_cursor is not None and stored_cursor.tzinfo is None:
         stored_cursor = stored_cursor.replace(tzinfo=UTC)  # drivers without tz
@@ -76,13 +106,14 @@ def _sync(
 
     started = time.monotonic()
     logger.info("Sync started: changed_at=%s", cursor)
+    committing = False
     try:
         processed = 0
         newest: datetime | None = None
-        for item in EventsPaginator(client, changed_at=cursor):
+        async for item in EventsPaginator(client, changed_at=cursor):
             if stop is not None and stop.is_set():
                 raise SyncStoppedError
-            events.upsert(item.to_row())
+            await events.upsert(item.to_row())
             processed += 1
             if newest is None or item.changed_at > newest:
                 newest = item.changed_at
@@ -90,25 +121,44 @@ def _sync(
             raise SyncStoppedError
         if newest is not None and stored_cursor is not None:
             newest = max(newest, stored_cursor)
-        metadata.save(
+        await metadata.save(
             sync_status=STATUS_SUCCESS,
             last_sync_time=datetime.now(UTC),
             last_changed_at=newest,  # None (no events) keeps the old cursor
         )
-        session.commit()
+        committing = True
+        await session.commit()
+        committing = False
     except SyncStoppedError:
         # Not a failure: the status and the cursor stay as they were.
-        session.rollback()
+        await _rollback(session)
         logger.info("Sync stopped on request after %.2fs", time.monotonic() - started)
         raise
+    except asyncio.CancelledError:
+        # Not a failure either. CancelledError is not an ``Exception``, so the
+        # clause below does not see it; nothing may stay half saved.
+        await _rollback_after_cancel(session)
+        if committing:
+            # The COMMIT may have reached the database before the cancellation did.
+            logger.warning(
+                "Sync cancelled during the commit after %.2fs: it is not known "
+                "whether the events and the cursor were saved; the next sync starts "
+                "from the cursor that is stored",
+                time.monotonic() - started,
+            )
+        else:
+            logger.info(
+                "Sync cancelled after %.2fs and rolled back", time.monotonic() - started
+            )
+        raise
     except Exception:
-        session.rollback()
+        await _rollback(session)
         logger.exception(
             "Sync failed after %.2fs, cursor stays at %s",
             time.monotonic() - started,
             cursor,
         )
-        _record_failure(session)
+        await _record_failure(session)
         raise
     new_cursor = newest.astimezone(UTC).date() if newest else cursor
     logger.info(
@@ -120,12 +170,12 @@ def _sync(
     return SyncResult(processed=processed, changed_at_cursor=new_cursor)
 
 
-def _record_failure(session: Session) -> None:
+async def _record_failure(session: AsyncSession) -> None:
     try:
-        SyncMetadataRepository(session).save(sync_status=STATUS_ERROR)
-        session.commit()
+        await SyncMetadataRepository(session).save(sync_status=STATUS_ERROR)
+        await session.commit()
     except Exception:
-        session.rollback()
+        await session.rollback()
         logger.exception("Could not record the sync error status")
 
 
@@ -142,7 +192,11 @@ class EventNotPublishedError(RuntimeError):
 
 
 class SeatsCache:
-    """In-memory TTL cache of free seats by event id; safe to share between threads."""
+    """In-memory TTL cache of free seats by event id.
+
+    Plain dictionary operations, no ``await`` inside: nothing can interleave. The
+    lock only keeps it safe if it is ever touched from a thread as well.
+    """
 
     def __init__(self, ttl: float = SEATS_CACHE_TTL, clock=time.monotonic):
         self._ttl = ttl
@@ -173,27 +227,38 @@ class SeatsCache:
 seats_cache = SeatsCache()
 
 
-def get_available_seats(
-    session: Session,
+async def get_available_seats(
+    session: AsyncSession,
     client: EventsProviderClient,
     cache: SeatsCache,
     event_id: str,
 ) -> list[str]:
     """Free seats of a published event; cached successes only.
 
-    The lock is never held during the provider request, so concurrent misses may
-    each fetch once; that is harmless and keeps slow requests from blocking others.
+    Read the event, release the connection, then (maybe) ask the provider: no
+    database connection is held while the provider answers. The cache lock is never
+    held during the request either, so concurrent misses may each fetch once; that
+    is harmless and keeps slow requests from blocking others.
     """
-    event = EventRepository(session).get(event_id)
+    event = await EventRepository(session).get(event_id)
+    status = event.status if event is not None else None  # read before the release
+    await session.commit()  # read-only: just gives the connection back
     if event is None:
         raise EventNotFoundError(event_id)
-    if event.status != PUBLISHED:
+    if status != PUBLISHED:
         raise EventNotPublishedError(event_id)
+    return await _free_seats(client, cache, event_id)
+
+
+async def _free_seats(
+    client: EventsProviderClient, cache: SeatsCache, event_id: str
+) -> list[str]:
+    """Cache or provider; touches no database."""
     seats = cache.get(event_id)
     if seats is not None:
         return seats
     try:
-        seats = client.get_event_seats(event_id)
+        seats = await client.get_event_seats(event_id)
     except ProviderRejectedError as exc:
         if exc.status_code == 404:
             # The provider does not know an event we have locally.
@@ -253,8 +318,8 @@ def seat_in_pattern(seat: str, pattern: str) -> bool:
     return unknown
 
 
-def register_ticket(
-    session: Session,
+async def register_ticket(
+    session: AsyncSession,
     client: EventsProviderClient,
     cache: SeatsCache,
     *,
@@ -267,27 +332,34 @@ def register_ticket(
 ) -> str:
     """Register a participant at the provider, then save the ticket locally.
 
-    The local checks are only a pre-filter; the provider decides. The POST is sent
-    once and never retried. No cache lock is held during the network call.
+    Read the event, release the connection, check, ask the provider, and save the
+    ticket in a new transaction. The local checks are only a pre-filter; the provider
+    decides. The POST is sent once and never retried. No cache lock is held during
+    the network call.
     """
-    event = EventRepository(session).get(event_id)
+    event = await EventRepository(session).get(event_id)
+    if event is not None:  # everything needed is read before the release
+        status = event.status
+        deadline = event.registration_deadline
+        seats_pattern = event.place_seats_pattern
+    await session.commit()  # read-only: just gives the connection back
+
     if event is None:
         raise EventNotFoundError(event_id)
-    if event.status != PUBLISHED:
+    if status != PUBLISHED:
         raise EventNotPublishedError(event_id)
-    deadline = event.registration_deadline
     if deadline is not None:
         if deadline.tzinfo is None:
             deadline = deadline.replace(tzinfo=UTC)  # drivers without tz
         if (now or datetime.now(UTC)) > deadline:
             raise RegistrationClosedError(event_id)
-    if not seat_in_pattern(seat, event.place_seats_pattern):
+    if not seat_in_pattern(seat, seats_pattern):
         raise InvalidSeatError(event_id)
-    if seat not in get_available_seats(session, client, cache, event_id):
+    if seat not in await _free_seats(client, cache, event_id):
         raise SeatUnavailableError(event_id)
 
     try:
-        ticket_id = client.register(
+        ticket_id = await client.register(
             event_id,
             first_name=first_name,
             last_name=last_name,
@@ -304,7 +376,7 @@ def register_ticket(
     # The seat is taken at the provider from now on, whatever happens locally.
     cache.invalidate(event_id)
     try:
-        TicketRepository(session).add(
+        await TicketRepository(session).add(
             ticket_id=ticket_id,
             event_id=event_id,
             first_name=first_name,
@@ -312,9 +384,19 @@ def register_ticket(
             email=email,
             seat=seat,
         )
-        session.commit()
+        await session.commit()
+    except asyncio.CancelledError:
+        # Nobody is left to report to; the ids make the ticket findable in the log.
+        logger.error(
+            "Provider confirmed ticket %s for event %s but the task was cancelled "
+            "during the local save: whether the ticket was stored is not known",
+            ticket_id,
+            event_id,
+        )
+        await _rollback_after_cancel(session)
+        raise
     except Exception:
-        session.rollback()
+        await _rollback(session)
         # Ids only: no names or emails in logs. Not compensated automatically.
         logger.exception(
             "Provider confirmed ticket %s for event %s but the local save failed",
@@ -352,12 +434,13 @@ class CancellationNotSavedError(RuntimeError):
 
 # Tickets whose DELETE is in flight in this process. A second request for the same
 # ticket must not send another DELETE: the provider's idempotency is unconfirmed.
+# No lock: checking and adding happen without an ``await`` in between, so in one
+# event loop nobody can slip in between.
 _cancelling: set[str] = set()
-_cancelling_lock = threading.Lock()
 
 
-def cancel_ticket(
-    session: Session,
+async def cancel_ticket(
+    session: AsyncSession,
     client: EventsProviderClient,
     cache: SeatsCache,
     ticket_id: str,
@@ -368,43 +451,44 @@ def cancel_ticket(
     The DELETE is sent once and never retried. The ticket row is kept (history);
     only ``cancelled_at`` is set, and only after the provider confirmed.
     """
-    # The lock comes first: the ticket is read only while holding it, so a request
-    # that waited behind a finished cancellation sees the ticket as cancelled.
-    with _cancelling_lock:
-        if ticket_id in _cancelling:
-            raise CancellationInProgressError(ticket_id)
-        _cancelling.add(ticket_id)
+    # The guard comes first: the ticket is read only while holding it, so a request
+    # that came after a finished cancellation sees the ticket as cancelled.
+    if ticket_id in _cancelling:
+        raise CancellationInProgressError(ticket_id)
+    _cancelling.add(ticket_id)
     try:
-        event_id = _cancel(session, client, cache, ticket_id, now)
+        event_id = await _cancel(session, client, cache, ticket_id, now)
     finally:
-        with _cancelling_lock:
-            _cancelling.discard(ticket_id)
+        _cancelling.discard(ticket_id)
     logger.info("Ticket %s cancelled for event %s", ticket_id, event_id)
 
 
-def _cancel(
-    session: Session,
+async def _cancel(
+    session: AsyncSession,
     client: EventsProviderClient,
     cache: SeatsCache,
     ticket_id: str,
     now: datetime | None,
 ) -> str:
     tickets = TicketRepository(session)
-    ticket = tickets.get_active(ticket_id)
+    ticket = await tickets.get_active(ticket_id)
     if ticket is None:
+        await session.commit()  # nothing more to read: give the connection back
         raise TicketNotFoundError(ticket_id)
     event_id = ticket.event_id
-    event = EventRepository(session).get(event_id)
+    event = await EventRepository(session).get(event_id)
+    started_at = event.event_time if event is not None else None
+    await session.commit()  # read-only: just gives the connection back
+
     if event is None:
         raise EventNotFoundError(event_id)
-    started_at = event.event_time
     if started_at.tzinfo is None:
         started_at = started_at.replace(tzinfo=UTC)  # drivers without tz
     if (now or datetime.now(UTC)) >= started_at:
         raise EventStartedError(event_id)
 
     try:
-        client.unregister(event_id, ticket_id)
+        await client.unregister(event_id, ticket_id)
     except ProviderRejectedError as exc:
         if exc.status_code == 400:
             raise CancellationRejectedError(ticket_id) from None
@@ -416,10 +500,20 @@ def _cancel(
     # The seat is free at the provider from now on, whatever happens locally.
     cache.invalidate(event_id)
     try:
-        tickets.cancel(ticket, datetime.now(UTC))
-        session.commit()
+        # ``ticket`` was loaded in the first transaction; this UPDATE opens a new one.
+        await tickets.cancel(ticket, datetime.now(UTC))
+        await session.commit()
+    except asyncio.CancelledError:
+        logger.error(
+            "Provider cancelled ticket %s for event %s but the task was cancelled "
+            "during the local save: whether the cancellation was stored is not known",
+            ticket_id,
+            event_id,
+        )
+        await _rollback_after_cancel(session)
+        raise
     except Exception:
-        session.rollback()
+        await _rollback(session)
         logger.exception(
             "Provider cancelled ticket %s for event %s but the local save failed",
             ticket_id,

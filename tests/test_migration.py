@@ -2,8 +2,8 @@
 
 Offline tests render SQL and need no database. Tests marked ``postgres`` run
 against a *disposable* PostgreSQL given by ``TEST_DATABASE_URL`` and are
-skipped otherwise. They run ``downgrade``, so the database name must contain
-"test"; never point them at a real database.
+skipped otherwise. They run ``downgrade``; the ``postgres_url`` fixture (conftest)
+refuses any database that is not a local ``*_test`` one.
 """
 
 from io import StringIO
@@ -49,9 +49,6 @@ def test_online_migration_without_configuration_fails_clearly(
 
 @pytest.fixture
 def pg_engine(postgres_url, alembic_config, monkeypatch):
-    name = make_url(postgres_url).database or ""
-    if "test" not in name:
-        pytest.fail("TEST_DATABASE_URL database name must contain 'test'")
     monkeypatch.setenv("POSTGRES_CONNECTION_STRING", postgres_url)
     engine = create_engine(make_url(postgres_url).set(drivername="postgresql+psycopg"))
     with engine.begin() as conn:

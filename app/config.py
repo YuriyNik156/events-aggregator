@@ -6,6 +6,7 @@ from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
 
 DRIVER = "postgresql+psycopg"
+ASYNC_DRIVER = "postgresql+psycopg_async"
 PARTS_VARS = (
     "POSTGRES_HOST",
     "POSTGRES_PORT",
@@ -55,6 +56,13 @@ def get_database_url() -> URL:
         port=port,
         database=values["POSTGRES_DATABASE_NAME"],
     )
+
+
+def get_async_database_url() -> URL:
+    """The same database as ``get_database_url()`` for the async application engine.
+
+    Alembic keeps using the synchronous URL; only the driver differs here."""
+    return get_database_url().set(drivername=ASYNC_DRIVER)
 
 
 def _from_connection_string(value: str) -> URL:

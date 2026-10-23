@@ -135,26 +135,29 @@ def test_url_repr_masks_password(clean_db_env):
     assert "topsecret" not in str(get_database_url())
 
 
-def test_importing_database_module_does_not_need_configuration(clean_db_env):
+@pytest.mark.anyio
+async def test_importing_database_module_does_not_need_configuration(clean_db_env):
     import app.database as database
 
-    database.dispose_engine()
+    await database.dispose_async_engine()
     # Only creating the engine requires configuration, and it fails clearly.
     with pytest.raises(ConfigError):
-        database.get_engine()
+        database.get_async_engine()
 
 
-def test_engine_is_lazy_and_does_not_connect(clean_db_env):
+@pytest.mark.anyio
+async def test_engine_is_lazy_and_does_not_connect(clean_db_env):
     import app.database as database
 
     clean_db_env.setenv("POSTGRES_CONNECTION_STRING", "postgresql://u:p@192.0.2.1/db")
-    database.dispose_engine()
+    await database.dispose_async_engine()
     try:
-        engine = database.get_engine()  # must not open a connection
+        engine = database.get_async_engine()  # must not open a connection
         assert engine.pool.checkedout() == 0
-        assert database.get_engine() is engine
+        assert database.get_async_engine() is engine
+        assert engine.url.drivername == "postgresql+psycopg_async"
     finally:
-        database.dispose_engine()
+        await database.dispose_async_engine()
 
 
 @pytest.mark.parametrize(

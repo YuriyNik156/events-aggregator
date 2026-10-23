@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, time
 from typing import Annotated
@@ -9,17 +9,21 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import (
     DEFAULT_SYNC_INTERVAL,
     ConfigError,
-    get_provider_settings,
     get_public_base_url,
     get_sync_interval,
 )
-from app.database import dispose_engine, get_session_factory
-from app.events_provider import EventsProviderClient, ProviderError
+from app.database import dispose_async_engine, get_async_session_factory
+from app.events_provider import (
+    EventsProviderClient,
+    ProviderError,
+    close_shared_client,
+    get_shared_client,
+)
 from app.repositories import EventRepository
 from app.schemas import (
     EventDetailOut,
@@ -77,10 +81,16 @@ async def lifespan(_: FastAPI):
         worker.start()
     yield
     if worker is not None and not await worker.stop():
-        # The sync thread still uses the engine and ends after its current request.
-        logger.warning("Background sync is still stopping; the engine is not disposed")
+        # Not even a cancelled sync has unwound: it may still use the client and the
+        # engine, so they stay open (the process is going away anyway).
+        logger.warning(
+            "Background sync is still stopping; the client and the engine stay open"
+        )
         return
-    dispose_engine()
+    try:
+        await close_shared_client()
+    finally:
+        await dispose_async_engine()
 
 
 app = FastAPI(title="Events Aggregator", lifespan=lifespan)
@@ -96,40 +106,40 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     return JSONResponse({"detail": errors}, status_code=400)
 
 
-def get_session() -> Iterator[Session]:
-    with get_session_factory()() as session:
+# The dependencies are ``async`` on purpose: a plain ``def`` one would be run in the
+# thread pool for nothing.
+
+
+async def get_session() -> AsyncIterator[AsyncSession]:
+    """A session of its own for every request, closed (rolled back) at its end."""
+    async with get_async_session_factory()() as session:
         yield session
 
 
-def get_provider_client() -> Iterator[EventsProviderClient]:
+async def get_provider_client() -> EventsProviderClient:
     try:
-        settings = get_provider_settings()
+        return get_shared_client()
     except ConfigError as exc:
         logger.error("Events Provider is not configured: %s", exc)
         raise HTTPException(500, "Events Provider is not configured") from None
-    client = EventsProviderClient(settings.base_url, settings.api_key)
-    try:
-        yield client
-    finally:
-        client.close()
 
 
-def get_seats_cache() -> SeatsCache:
+async def get_seats_cache() -> SeatsCache:
     return seats_cache
 
 
 @app.get("/api/health")
-def health_check():
+async def health_check():
     return {"status": "ok"}
 
 
 @app.post("/api/sync/trigger")
-def trigger_sync(
-    session: Annotated[Session, Depends(get_session)],
+async def trigger_sync(
+    session: Annotated[AsyncSession, Depends(get_session)],
     client: Annotated[EventsProviderClient, Depends(get_provider_client)],
 ):
     try:
-        sync_events(session, client)
+        await sync_events(session, client)
     except SyncAlreadyRunningError:
         raise HTTPException(409, "Synchronization is already running") from None
     except ProviderError:
@@ -138,15 +148,15 @@ def trigger_sync(
 
 
 @app.get("/api/events", response_model=EventsPageOut)
-def list_events(
+async def list_events(
     request: Request,
-    session: Annotated[Session, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
     date_from: date | None = None,
     page: Annotated[int, Query(ge=1)] = 1,
     page_size: Annotated[int, Query(ge=1)] = 20,
 ):
     start = datetime.combine(date_from, time.min, tzinfo=UTC) if date_from else None
-    events, count = EventRepository(session).list(
+    events, count = await EventRepository(session).list(
         date_from=start, page=page, page_size=page_size
     )
 
@@ -167,22 +177,24 @@ def list_events(
 
 
 @app.get("/api/events/{event_id}", response_model=EventDetailOut)
-def get_event(event_id: str, session: Annotated[Session, Depends(get_session)]):
-    event = EventRepository(session).get(event_id)
+async def get_event(
+    event_id: str, session: Annotated[AsyncSession, Depends(get_session)]
+):
+    event = await EventRepository(session).get(event_id)
     if event is None:
         raise HTTPException(404, "Event not found")
     return EventDetailOut.from_event(event)
 
 
 @app.get("/api/events/{event_id}/seats", response_model=SeatsOut)
-def get_event_seats(
+async def get_event_seats(
     event_id: str,
-    session: Annotated[Session, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
     client: Annotated[EventsProviderClient, Depends(get_provider_client)],
     cache: Annotated[SeatsCache, Depends(get_seats_cache)],
 ):
     try:
-        seats = get_available_seats(session, client, cache, event_id)
+        seats = await get_available_seats(session, client, cache, event_id)
     except EventNotFoundError:
         raise HTTPException(404, "Event not found") from None
     except EventNotPublishedError:
@@ -194,14 +206,14 @@ def get_event_seats(
 
 
 @app.post("/api/tickets", status_code=201, response_model=TicketCreatedOut)
-def create_ticket(
+async def create_ticket(
     body: TicketCreate,
-    session: Annotated[Session, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
     client: Annotated[EventsProviderClient, Depends(get_provider_client)],
     cache: Annotated[SeatsCache, Depends(get_seats_cache)],
 ):
     try:
-        ticket_id = register_ticket(session, client, cache, **body.model_dump())
+        ticket_id = await register_ticket(session, client, cache, **body.model_dump())
     except EventNotFoundError:
         raise HTTPException(404, "Event not found") from None
     except EventNotPublishedError:
@@ -230,14 +242,14 @@ def create_ticket(
 
 
 @app.delete("/api/tickets/{ticket_id}")
-def delete_ticket(
+async def delete_ticket(
     ticket_id: str,
-    session: Annotated[Session, Depends(get_session)],
+    session: Annotated[AsyncSession, Depends(get_session)],
     client: Annotated[EventsProviderClient, Depends(get_provider_client)],
     cache: Annotated[SeatsCache, Depends(get_seats_cache)],
 ):
     try:
-        cancel_ticket(session, client, cache, ticket_id)
+        await cancel_ticket(session, client, cache, ticket_id)
     except TicketNotFoundError:
         raise HTTPException(404, "Ticket not found") from None
     except EventNotFoundError:
